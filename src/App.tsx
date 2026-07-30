@@ -1005,7 +1005,6 @@ function App() {
           onNewThread={createNewThread}
           onSearch={() => setSearchDialogOpen(true)}
           onOpenSettings={() => setSettingsDialogOpen(true)}
-          onChooseFolder={() => void chooseProjectFolder()}
           width={leftWidth}
           onResizeStart={startLeftResize}
           onResetWidth={() =>
@@ -1143,7 +1142,6 @@ function LeftSidebar({
   onNewThread,
   onSearch,
   onOpenSettings,
-  onChooseFolder,
   onResizeStart,
   onResetWidth,
   onAdjustWidth,
@@ -1158,7 +1156,6 @@ function LeftSidebar({
   onNewThread: () => void;
   onSearch: () => void;
   onOpenSettings: () => void;
-  onChooseFolder: () => void;
   onResizeStart: (event: ReactPointerEvent<HTMLDivElement>) => void;
   onResetWidth: () => void;
   onAdjustWidth: (delta: number) => void;
@@ -1180,9 +1177,6 @@ function LeftSidebar({
   const brandMenuRef = useRef<HTMLDivElement>(null);
   const selectedThread = threads.find(
     (thread) => thread.id === selectedThreadId,
-  );
-  const selectedProject = projects.find(
-    (project) => project.id === selectedThread?.projectId,
   );
   const pinnedThreads = threads
     .filter((thread) => thread.pinnedAt !== null)
@@ -1355,11 +1349,6 @@ function LeftSidebar({
     </div>
   );
 
-  const runBrandAction = (action: () => void) => {
-    setBrandMenuOpen(false);
-    action();
-  };
-
   return (
     <aside className="left-sidebar">
       <div className="brand-row">
@@ -1369,10 +1358,10 @@ function LeftSidebar({
             brandMenuOpen ? "active" : ""
           }`}
           data-sidebar-brand-menu
-          aria-label="漫剧 Agent 工作区"
+          aria-label="选择 Agent"
           aria-haspopup="menu"
           aria-expanded={brandMenuOpen}
-          aria-controls="brand-workspace-menu"
+          aria-controls="brand-agent-menu"
           onClick={() => setBrandMenuOpen((open) => !open)}
           onKeyDown={(event) => {
             if (event.key === "ArrowDown") {
@@ -1397,14 +1386,14 @@ function LeftSidebar({
         </button>
 
         <div
-          id="brand-workspace-menu"
+          id="brand-agent-menu"
           ref={brandMenuRef}
-          className={`brand-workspace-menu ${
+          className={`brand-agent-menu ${
             brandMenuOpen ? "open" : ""
           }`}
           data-sidebar-brand-menu
           role="menu"
-          aria-label="工作区菜单"
+          aria-label="Agent 列表"
           aria-hidden={!brandMenuOpen}
           onKeyDown={(event) => {
             const items = Array.from(
@@ -1439,61 +1428,22 @@ function LeftSidebar({
             }
           }}
         >
-          <div className="brand-menu-heading">
-            <strong>漫剧 Agent</strong>
-            <span>小说 → 分镜 → 漫画 → 漫剧</span>
-          </div>
-          <div className="brand-menu-current">
-            <span className="brand-menu-avatar">
-              <FolderOpen size={14} />
+          <div className="agent-menu-heading">选择 Agent</div>
+          <button
+            className="agent-menu-item current"
+            role="menuitemradio"
+            aria-checked="true"
+            tabIndex={brandMenuOpen ? 0 : -1}
+            onClick={() => setBrandMenuOpen(false)}
+          >
+            <span className="agent-menu-icon">
+              <Clapperboard size={16} />
             </span>
-            <span>
-              <strong>
-                {selectedProject?.name ?? "未绑定项目文件夹"}
-              </strong>
-              <small>
-                {selectedProject
-                  ? "当前任务的项目上下文"
-                  : "当前任务可直接开始对话"}
-              </small>
+            <span className="agent-menu-copy">
+              <strong>漫剧 Agent</strong>
+              <small>小说拆解、分镜、漫画与漫剧生成</small>
             </span>
-            {selectedProject && <Check size={16} />}
-          </div>
-          <div className="brand-menu-divider" />
-          <button
-            role="menuitem"
-            tabIndex={brandMenuOpen ? 0 : -1}
-            onClick={() => runBrandAction(onNewThread)}
-          >
-            <SquarePen size={16} />
-            <span>新建任务</span>
-          </button>
-          <button
-            role="menuitem"
-            tabIndex={brandMenuOpen ? 0 : -1}
-            onClick={() => runBrandAction(onSearch)}
-          >
-            <Search size={16} />
-            <span>搜索任务</span>
-            <kbd>Ctrl K</kbd>
-          </button>
-          <button
-            role="menuitem"
-            tabIndex={brandMenuOpen ? 0 : -1}
-            onClick={() => runBrandAction(onChooseFolder)}
-          >
-            <FolderOpen size={16} />
-            <span>
-              {selectedProject ? "更换项目文件夹" : "选择项目文件夹"}
-            </span>
-          </button>
-          <button
-            role="menuitem"
-            tabIndex={brandMenuOpen ? 0 : -1}
-            onClick={() => runBrandAction(onOpenSettings)}
-          >
-            <Settings size={16} />
-            <span>设置</span>
+            <Check size={16} />
           </button>
         </div>
       </div>
