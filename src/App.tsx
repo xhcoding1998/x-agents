@@ -27,6 +27,8 @@ import {
   MoreHorizontal,
   PanelRightClose,
   PanelRightOpen,
+  Pin,
+  PinOff,
   Plus,
   RotateCcw,
   Save,
@@ -71,6 +73,7 @@ type Thread = {
   id: string;
   title: string;
   projectId: string | null;
+  pinnedAt: number | null;
   createdAt: number;
   updatedAt: number;
   messages: Message[];
@@ -126,7 +129,18 @@ type WorkspaceSearchItem = {
   category?: ResourceCategory;
 };
 
+type SidebarSectionKey = "pinned" | "projects" | "recent";
+
+type SidebarPreferences = {
+  collapsedSections: SidebarSectionKey[];
+  collapsedProjectIds: string[];
+};
+
 const emptyWorkspace: WorkspaceState = { projects: [], threads: [] };
+const defaultSidebarPreferences: SidebarPreferences = {
+  collapsedSections: [],
+  collapsedProjectIds: [],
+};
 
 const defaultModelConfigs: ModelConfigs = {
   chat: {
@@ -191,6 +205,7 @@ function createThread(
     id: createId(),
     title,
     projectId,
+    pinnedAt: null,
     createdAt: now,
     updatedAt: now,
     messages: [],
@@ -246,27 +261,77 @@ function normalizeWorkspace(value: unknown): WorkspaceState {
         : [],
     }));
 
+  const projectIds = new Set(projects.map((project) => project.id));
+  const normalizeThread = (
+    thread: Partial<Thread>,
+    fallbackProjectId: string | null,
+  ): Thread | null => {
+    if (typeof thread.id !== "string") return null;
+    const candidateProjectId =
+      typeof thread.projectId === "string"
+        ? thread.projectId
+        : fallbackProjectId;
+    const projectId =
+      candidateProjectId && projectIds.has(candidateProjectId)
+        ? candidateProjectId
+        : null;
+    const createdAt =
+      typeof thread.createdAt === "number"
+        ? thread.createdAt
+        : Date.now();
+    return {
+      id: thread.id,
+      title:
+        typeof thread.title === "string" && thread.title.trim()
+          ? thread.title
+          : "未命名任务",
+      projectId,
+      pinnedAt:
+        typeof thread.pinnedAt === "number"
+          ? thread.pinnedAt
+          : null,
+      createdAt,
+      updatedAt:
+        typeof thread.updatedAt === "number"
+          ? thread.updatedAt
+          : createdAt,
+      messages: Array.isArray(thread.messages)
+        ? thread.messages
+        : [],
+    };
+  };
+
   const migratedThreads = rawProjects.flatMap((project) =>
     Array.isArray(project.threads)
-      ? project.threads.map((thread) => ({
-          ...thread,
-          projectId: project.id ?? null,
-        }))
+      ? project.threads
+          .map((thread) =>
+            normalizeThread(
+              thread,
+              typeof project.id === "string" ? project.id : null,
+            ),
+          )
+          .filter((thread): thread is Thread => thread !== null)
       : [],
   );
   const directThreads = Array.isArray(raw.threads)
-    ? raw.threads.map((thread) => ({
-        ...thread,
-        projectId:
-          typeof thread.projectId === "string"
-            ? thread.projectId
-            : null,
-      }))
+    ? raw.threads
+        .map((thread) => normalizeThread(thread, null))
+        .filter((thread): thread is Thread => thread !== null)
     : [];
+  const mergedThreads = new Map<string, Thread>();
+  [...migratedThreads, ...directThreads].forEach((thread) => {
+    mergedThreads.set(thread.id, thread);
+  });
+  const threads = [...mergedThreads.values()].filter(
+    (thread) =>
+      thread.projectId !== null ||
+      thread.messages.length > 0 ||
+      thread.title !== "新任务",
+  );
 
   return {
     projects,
-    threads: directThreads.length > 0 ? directThreads : migratedThreads,
+    threads,
   };
 }
 
@@ -274,6 +339,7 @@ function useWorkspaceState() {
   const [value, setValue] = useState<WorkspaceState>(() => {
     try {
       const raw =
+        window.localStorage.getItem("manju-agent-workspace-v4") ??
         window.localStorage.getItem("manju-agent-workspace-v3") ??
         window.localStorage.getItem("manju-agent-workspace-v2");
       return raw ? normalizeWorkspace(JSON.parse(raw)) : emptyWorkspace;
@@ -284,7 +350,7 @@ function useWorkspaceState() {
 
   useEffect(() => {
     window.localStorage.setItem(
-      "manju-agent-workspace-v3",
+      "manju-agent-workspace-v4",
       JSON.stringify(value),
     );
   }, [value]);
@@ -323,8 +389,24 @@ function App() {
     "manju-agent-right-width-v2",
     380,
   );
+  const [lastSelectedThreadId, setLastSelectedThreadId] =
+    useStoredState("manju-agent-last-thread-v1", "");
   const [rightResizing, setRightResizing] = useState(false);
-  const [selectedThreadId, setSelectedThreadId] = useState("");
+  const [selectedThreadId, setSelectedThreadId] = useState(() => {
+    if (
+      lastSelectedThreadId &&
+      workspace.threads.some(
+        (thread) => thread.id === lastSelectedThreadId,
+      )
+    ) {
+      return lastSelectedThreadId;
+    }
+    return (
+      [...workspace.threads].sort(
+        (left, right) => right.updatedAt - left.updatedAt,
+      )[0]?.id ?? ""
+    );
+  });
   const [selectedResourceId, setSelectedResourceId] = useState("");
   const [rightTab, setRightTab] = useState<"files" | "tasks">("files");
   const [activeModelKind, setActiveModelKind] =
@@ -418,10 +500,8 @@ function App() {
   );
 
   useEffect(() => {
-    if (!selectedThreadId && workspace.threads[0]) {
-      setSelectedThreadId(workspace.threads[0].id);
-    }
-  }, [selectedThreadId, workspace.threads]);
+    setLastSelectedThreadId(selectedThreadId);
+  }, [selectedThreadId, setLastSelectedThreadId]);
 
   useEffect(() => {
     if (!toast) return;
@@ -467,13 +547,21 @@ function App() {
     }));
   };
 
-  const createNewThread = () => {
-    const thread = createThread();
-    setWorkspace((current) => ({
+  const toggleThreadPinned = (threadId: string) => {
+    const thread = workspace.threads.find(
+      (item) => item.id === threadId,
+    );
+    if (!thread) return;
+    const willPin = thread.pinnedAt === null;
+    updateThread(threadId, (current) => ({
       ...current,
-      threads: [thread, ...current.threads],
+      pinnedAt: willPin ? Date.now() : null,
     }));
-    setSelectedThreadId(thread.id);
+    setToast(willPin ? "任务已置顶" : "已取消置顶");
+  };
+
+  const createNewThread = () => {
+    setSelectedThreadId("");
     setSelectedResourceId("");
     setComposer("");
     window.setTimeout(() => composerRef.current?.focus(), 0);
@@ -843,6 +931,7 @@ function App() {
           onNewThread={createNewThread}
           onSearch={() => setSearchDialogOpen(true)}
           onOpenSettings={() => setSettingsDialogOpen(true)}
+          onToggleThreadPinned={toggleThreadPinned}
           onSelectThread={(threadId) => {
             setSelectedThreadId(threadId);
             setSelectedResourceId("");
@@ -960,6 +1049,7 @@ function LeftSidebar({
   onNewThread,
   onSearch,
   onOpenSettings,
+  onToggleThreadPinned,
   onSelectThread,
 }: {
   projects: Project[];
@@ -969,14 +1059,161 @@ function LeftSidebar({
   onNewThread: () => void;
   onSearch: () => void;
   onOpenSettings: () => void;
+  onToggleThreadPinned: (threadId: string) => void;
   onSelectThread: (threadId: string) => void;
 }) {
+  const [preferences, setPreferences] =
+    useStoredState<SidebarPreferences>(
+      "manju-agent-sidebar-preferences-v1",
+      defaultSidebarPreferences,
+    );
+  const [threadMenu, setThreadMenu] = useState<{
+    threadId: string;
+    left: number;
+    top: number;
+  } | null>(null);
   const selectedThread = threads.find(
     (thread) => thread.id === selectedThreadId,
   );
+  const pinnedThreads = threads
+    .filter((thread) => thread.pinnedAt !== null)
+    .sort(
+      (left, right) =>
+        (right.pinnedAt ?? 0) - (left.pinnedAt ?? 0),
+    );
   const recentThreads = threads
-    .filter((thread) => !thread.projectId)
+    .filter(
+      (thread) =>
+        !thread.projectId && thread.pinnedAt === null,
+    )
     .sort((left, right) => right.updatedAt - left.updatedAt);
+  const sortedProjects = [...projects].sort((left, right) => {
+    const activity = (projectId: string) =>
+      threads
+        .filter((thread) => thread.projectId === projectId)
+        .reduce(
+          (latest, thread) => Math.max(latest, thread.updatedAt),
+          0,
+        );
+    return activity(right.id) - activity(left.id);
+  });
+
+  const isSectionCollapsed = (section: SidebarSectionKey) =>
+    preferences.collapsedSections.includes(section);
+
+  const toggleSection = (section: SidebarSectionKey) => {
+    setPreferences((current) => ({
+      ...current,
+      collapsedSections: current.collapsedSections.includes(section)
+        ? current.collapsedSections.filter((item) => item !== section)
+        : [...current.collapsedSections, section],
+    }));
+  };
+
+  const toggleProject = (projectId: string) => {
+    setPreferences((current) => ({
+      ...current,
+      collapsedProjectIds: current.collapsedProjectIds.includes(
+        projectId,
+      )
+        ? current.collapsedProjectIds.filter(
+            (item) => item !== projectId,
+          )
+        : [...current.collapsedProjectIds, projectId],
+    }));
+  };
+
+  useEffect(() => {
+    const projectId = selectedThread?.projectId;
+    if (
+      projectId &&
+      preferences.collapsedProjectIds.includes(projectId)
+    ) {
+      setPreferences((current) => ({
+        ...current,
+        collapsedProjectIds: current.collapsedProjectIds.filter(
+          (item) => item !== projectId,
+        ),
+      }));
+    }
+  }, [
+    preferences.collapsedProjectIds,
+    selectedThread?.projectId,
+    setPreferences,
+  ]);
+
+  useEffect(() => {
+    if (!threadMenu) return;
+    const closeMenu = (event: PointerEvent) => {
+      if (
+        !(event.target as HTMLElement).closest(
+          "[data-sidebar-thread-menu]",
+        )
+      ) {
+        setThreadMenu(null);
+      }
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setThreadMenu(null);
+    };
+    window.addEventListener("pointerdown", closeMenu);
+    window.addEventListener("keydown", closeOnEscape);
+    return () => {
+      window.removeEventListener("pointerdown", closeMenu);
+      window.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [threadMenu]);
+
+  const openThreadMenu = (
+    event: ReactMouseEvent<HTMLButtonElement>,
+    threadId: string,
+  ) => {
+    event.stopPropagation();
+    const rect = event.currentTarget.getBoundingClientRect();
+    const menuWidth = 178;
+    const menuHeight = 52;
+    setThreadMenu({
+      threadId,
+      left: Math.max(
+        8,
+        Math.min(window.innerWidth - menuWidth - 8, rect.right - menuWidth),
+      ),
+      top:
+        rect.bottom + menuHeight + 8 > window.innerHeight
+          ? rect.top - menuHeight - 4
+          : rect.bottom + 4,
+    });
+  };
+
+  const renderThreadRow = (
+    thread: Thread,
+    className = "",
+    showPinIndicator = true,
+  ) => (
+    <div className={`thread-entry ${className}`} key={thread.id}>
+      <button
+        className={`thread-row ${
+          thread.id === selectedThreadId ? "selected" : ""
+        }`}
+        onClick={() => onSelectThread(thread.id)}
+        title={thread.title}
+      >
+        <span>{thread.title}</span>
+        {showPinIndicator && thread.pinnedAt !== null && (
+          <Pin className="thread-pin-indicator" size={12} />
+        )}
+      </button>
+      <button
+        className="thread-row-action"
+        data-sidebar-thread-menu
+        onClick={(event) => openThreadMenu(event, thread.id)}
+        aria-label={`${thread.title} 的更多操作`}
+        title="更多操作"
+      >
+        <MoreHorizontal size={16} />
+      </button>
+    </div>
+  );
 
   return (
     <aside className="left-sidebar">
@@ -1000,71 +1237,147 @@ function LeftSidebar({
           <SquarePen size={16} />
           <span>新建任务</span>
         </button>
+        <button className="nav-row" onClick={onSearch}>
+          <Search size={16} />
+          <span>搜索任务</span>
+          <kbd className="nav-shortcut">Ctrl K</kbd>
+        </button>
       </nav>
 
       <div className="project-list">
-        <div className="sidebar-section-header">
-          <span>项目</span>
-        </div>
-        {projects.length > 0 && (
-          <AnimatedList className="project-list-entries">
-            {projects.map((project) => {
-              const projectThreads = threads
-                .filter((thread) => thread.projectId === project.id)
-                .sort(
-                  (left, right) => right.updatedAt - left.updatedAt,
-                );
-              const selected =
-                selectedThread?.projectId === project.id;
-              return (
-                <div className="project-block" key={project.id}>
-                  <button
-                    className={`project-row ${selected ? "current" : ""}`}
-                    onClick={() => {
-                      if (projectThreads[0]) {
-                        onSelectThread(projectThreads[0].id);
-                      }
-                    }}
-                  >
-                    <Folder size={15} />
-                    <span>{project.name}</span>
-                  </button>
-                  {projectThreads.length > 0 && (
-                    <AnimatedList className="thread-list">
-                      {projectThreads.map((thread) => (
-                        <button
-                          key={thread.id}
-                          className={`thread-row ${thread.id === selectedThreadId ? "selected" : ""}`}
-                          onClick={() => onSelectThread(thread.id)}
-                        >
-                          <span>{thread.title}</span>
-                        </button>
-                      ))}
-                    </AnimatedList>
-                  )}
-                </div>
-              );
-            })}
-          </AnimatedList>
+        {pinnedThreads.length > 0 && (
+          <section className="sidebar-section">
+            <button
+              className="sidebar-section-header"
+              onClick={() => toggleSection("pinned")}
+            >
+              <span>置顶</span>
+              <ChevronRight
+                size={13}
+                className={
+                  isSectionCollapsed("pinned") ? "" : "open"
+                }
+              />
+            </button>
+            <div
+              className={`sidebar-section-content ${
+                isSectionCollapsed("pinned") ? "collapsed" : ""
+              }`}
+              aria-hidden={isSectionCollapsed("pinned")}
+              inert={isSectionCollapsed("pinned")}
+            >
+              <AnimatedList className="pinned-thread-list">
+                {pinnedThreads.map((thread) =>
+                  renderThreadRow(thread, "pinned-thread", false),
+                )}
+              </AnimatedList>
+            </div>
+          </section>
         )}
 
-        <div className="sidebar-section-header recent-header">
-          <span>最近</span>
-        </div>
+        {sortedProjects.length > 0 && (
+          <section className="sidebar-section">
+            <button
+              className="sidebar-section-header"
+              onClick={() => toggleSection("projects")}
+            >
+              <span>项目</span>
+              <ChevronRight
+                size={13}
+                className={
+                  isSectionCollapsed("projects") ? "" : "open"
+                }
+              />
+            </button>
+            <div
+              className={`sidebar-section-content ${
+                isSectionCollapsed("projects") ? "collapsed" : ""
+              }`}
+              aria-hidden={isSectionCollapsed("projects")}
+              inert={isSectionCollapsed("projects")}
+            >
+              <AnimatedList className="project-list-entries">
+                {sortedProjects.map((project) => {
+                  const projectThreads = threads
+                    .filter(
+                      (thread) => thread.projectId === project.id,
+                    )
+                    .sort(
+                      (left, right) =>
+                        right.updatedAt - left.updatedAt,
+                    );
+                  const selected =
+                    selectedThread?.projectId === project.id;
+                  const collapsed =
+                    preferences.collapsedProjectIds.includes(
+                      project.id,
+                    );
+                  return (
+                    <div className="project-block" key={project.id}>
+                      <button
+                        className={`project-row ${
+                          selected ? "current" : ""
+                        }`}
+                        onClick={() => toggleProject(project.id)}
+                      >
+                        <Folder size={15} />
+                        <span>{project.name}</span>
+                        <ChevronRight
+                          size={13}
+                          className={collapsed ? "" : "open"}
+                        />
+                      </button>
+                      <div
+                        className={`project-thread-content ${
+                          collapsed ? "collapsed" : ""
+                        }`}
+                        aria-hidden={collapsed}
+                        inert={collapsed}
+                      >
+                        {projectThreads.length > 0 && (
+                          <AnimatedList className="thread-list">
+                            {projectThreads.map((thread) =>
+                              renderThreadRow(thread),
+                            )}
+                          </AnimatedList>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
+              </AnimatedList>
+            </div>
+          </section>
+        )}
+
         {recentThreads.length > 0 && (
-          <AnimatedList className="recent-thread-list">
-            {recentThreads.map((thread) => (
-              <button
-                key={thread.id}
-                className={`thread-row recent-thread ${
-                  thread.id === selectedThreadId ? "selected" : ""
-                }`}
-                onClick={() => onSelectThread(thread.id)}
-              >
-                <span>{thread.title}</span>
-              </button>
-            ))}
-          </AnimatedList>
+          <section className="sidebar-section">
+            <button
+              className="sidebar-section-header"
+              onClick={() => toggleSection("recent")}
+            >
+              <span>最近</span>
+              <ChevronRight
+                size={13}
+                className={
+                  isSectionCollapsed("recent") ? "" : "open"
+                }
+              />
+            </button>
+            <div
+              className={`sidebar-section-content ${
+                isSectionCollapsed("recent") ? "collapsed" : ""
+              }`}
+              aria-hidden={isSectionCollapsed("recent")}
+              inert={isSectionCollapsed("recent")}
+            >
+              <AnimatedList className="recent-thread-list">
+                {recentThreads.map((thread) =>
+                  renderThreadRow(thread, "recent-thread"),
+                )}
+              </AnimatedList>
+            </div>
+          </section>
         )}
       </div>
 
@@ -1078,6 +1391,41 @@ function LeftSidebar({
         <strong>本地工作区</strong>
         <CircleHelp size={16} />
       </button>
+
+      {threadMenu && (
+        <div
+          className="sidebar-context-menu ui-popover"
+          data-sidebar-thread-menu
+          style={{
+            left: threadMenu.left,
+            top: threadMenu.top,
+          }}
+          role="menu"
+        >
+          <button
+            role="menuitem"
+            onClick={() => {
+              onToggleThreadPinned(threadMenu.threadId);
+              setThreadMenu(null);
+            }}
+          >
+            {threads.find(
+              (thread) => thread.id === threadMenu.threadId,
+            )?.pinnedAt !== null ? (
+              <PinOff size={15} />
+            ) : (
+              <Pin size={15} />
+            )}
+            <span>
+              {threads.find(
+                (thread) => thread.id === threadMenu.threadId,
+              )?.pinnedAt !== null
+                ? "取消置顶"
+                : "置顶任务"}
+            </span>
+          </button>
+        </div>
+      )}
     </aside>
   );
 }
