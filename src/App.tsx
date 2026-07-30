@@ -248,12 +248,12 @@ const modelProviderPresets: Record<
   ],
   video: [
     {
-      label: "自定义 REST",
-      baseUrl: "",
-      apiPath: "",
+      label: "字节火山方舟 Seedance",
+      baseUrl: "https://ark.cn-beijing.volces.com/api/v3",
+      apiPath: "contents/generations/tasks",
       headers: "{}",
-      description: "视频模型将在接入具体服务后补充协议适配",
-      modelPlaceholder: "填写视频模型或 Endpoint ID",
+      description: "Seedance 系列 · 文生视频、图生视频与异步任务",
+      modelPlaceholder: "填写 Seedance 模型 ID 或 Endpoint ID",
     },
   ],
 };
@@ -281,11 +281,11 @@ const defaultModelConfigs: ModelConfigs = {
   },
   video: {
     label: "视频模型",
-    provider: "自定义 REST",
-    baseUrl: "",
+    provider: "字节火山方舟 Seedance",
+    baseUrl: "https://ark.cn-beijing.volces.com/api/v3",
     model: "",
     apiKey: "",
-    apiPath: "",
+    apiPath: "contents/generations/tasks",
     headers: "{}",
     enabled: false,
   },
@@ -506,10 +506,14 @@ function App() {
       const imagePreset = modelProviderPresets.image[0];
       const imageNeedsMigration =
         current.image.provider !== imagePreset.label;
+      const videoPreset = modelProviderPresets.video[0];
+      const videoNeedsMigration =
+        current.video.provider !== videoPreset.label;
 
       if (
         normalizedChatProvider === current.chat.provider &&
-        !imageNeedsMigration
+        !imageNeedsMigration &&
+        !videoNeedsMigration
       ) {
         return current;
       }
@@ -529,6 +533,15 @@ function App() {
               headers: imagePreset.headers,
             }
           : current.image,
+        video: videoNeedsMigration
+          ? {
+              ...current.video,
+              provider: videoPreset.label,
+              baseUrl: videoPreset.baseUrl,
+              apiPath: videoPreset.apiPath,
+              headers: videoPreset.headers,
+            }
+          : current.video,
       };
     });
   }, [setModelConfigs]);
