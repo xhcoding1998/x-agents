@@ -3,7 +3,6 @@ import {
   AlertCircle,
   AudioLines,
   BookOpenText,
-  Boxes,
   CheckCircle2,
   Check,
   ChevronDown,
@@ -51,7 +50,7 @@ import {
   SpotlightSurface,
 } from "./components/MicroInteractions";
 
-type ViewMode = "chat" | "models" | "tasks";
+type ViewMode = "chat" | "settings";
 type ModelKind = "chat" | "image" | "video";
 type ResourceCategory =
   | "原著"
@@ -113,6 +112,18 @@ type ModelConfig = {
 };
 
 type ModelConfigs = Record<ModelKind, ModelConfig>;
+
+type WorkspaceSearchItem = {
+  id: string;
+  kind: "project" | "thread" | "resource";
+  title: string;
+  meta: string;
+  timestamp: number;
+  projectId: string;
+  threadId?: string;
+  resourceId?: string;
+  category?: ResourceCategory;
+};
 
 const emptyWorkspace: WorkspaceState = { projects: [] };
 
@@ -238,6 +249,7 @@ function App() {
   const [composer, setComposer] = useState("");
   const [isResponding, setIsResponding] = useState(false);
   const [projectDialogOpen, setProjectDialogOpen] = useState(false);
+  const [searchDialogOpen, setSearchDialogOpen] = useState(false);
   const [resourcePreviewOpen, setResourcePreviewOpen] = useState(false);
   const [toast, setToast] = useState("");
   const [testState, setTestState] = useState<{
@@ -334,6 +346,20 @@ function App() {
     const timer = window.setTimeout(() => setToast(""), 2600);
     return () => window.clearTimeout(timer);
   }, [toast]);
+
+  useEffect(() => {
+    const handleShortcut = (event: KeyboardEvent) => {
+      if (
+        (event.ctrlKey || event.metaKey) &&
+        event.key.toLowerCase() === "k"
+      ) {
+        event.preventDefault();
+        setSearchDialogOpen(true);
+      }
+    };
+    window.addEventListener("keydown", handleShortcut);
+    return () => window.removeEventListener("keydown", handleShortcut);
+  }, []);
 
   const updateProject = (
     projectId: string,
@@ -485,7 +511,7 @@ function App() {
       !config.model.trim()
     ) {
       setActiveModelKind("chat");
-      setViewMode("models");
+      setViewMode("settings");
       setToast("请先配置并启用对话模型");
       return;
     }
@@ -709,9 +735,8 @@ function App() {
           selectedThreadId={selectedThreadId}
           activeView={viewMode}
           onNewThread={createNewThread}
-          onImport={() => fileInputRef.current?.click()}
-          onOpenModels={() => setViewMode("models")}
-          onOpenTasks={() => setViewMode("tasks")}
+          onSearch={() => setSearchDialogOpen(true)}
+          onOpenSettings={() => setViewMode("settings")}
           onNewProject={() => setProjectDialogOpen(true)}
           onSelectProject={selectProject}
           onSelectThread={(projectId, threadId) => {
@@ -722,7 +747,7 @@ function App() {
         />
 
         <main className="center-pane">
-          {viewMode === "models" ? (
+          {viewMode === "settings" ? (
             <ModelSettingsView
               configs={modelConfigs}
               activeKind={activeModelKind}
@@ -732,12 +757,6 @@ function App() {
               onChange={updateModelConfig}
               onTest={() => void testModelConnection()}
               onSaved={() => setToast("模型配置已保存在本机")}
-              onToggleRight={() => setRightOpen((open) => !open)}
-            />
-          ) : viewMode === "tasks" ? (
-            <TaskQueueView
-              onBack={() => setViewMode("chat")}
-              rightOpen={rightOpen}
               onToggleRight={() => setRightOpen((open) => !open)}
             />
           ) : (
@@ -752,9 +771,9 @@ function App() {
               onSend={() => void sendMessage()}
               onCreateProject={() => setProjectDialogOpen(true)}
               onImport={() => fileInputRef.current?.click()}
-              onOpenModels={() => {
+              onOpenSettings={() => {
                 setActiveModelKind("chat");
-                setViewMode("models");
+                setViewMode("settings");
               }}
               onToggleRight={() => setRightOpen((open) => !open)}
             />
@@ -795,6 +814,37 @@ function App() {
         />
       )}
 
+      {searchDialogOpen && (
+        <WorkspaceSearchDialog
+          projects={workspace.projects}
+          onClose={() => setSearchDialogOpen(false)}
+          onSelectProject={(projectId) => {
+            const project = workspace.projects.find(
+              (item) => item.id === projectId,
+            );
+            if (project) selectProject(project);
+          }}
+          onSelectThread={(projectId, threadId) => {
+            setSelectedProjectId(projectId);
+            setSelectedThreadId(threadId);
+            setSelectedResourceId("");
+            setViewMode("chat");
+          }}
+          onSelectResource={(projectId, resourceId) => {
+            const project = workspace.projects.find(
+              (item) => item.id === projectId,
+            );
+            setSelectedProjectId(projectId);
+            setSelectedThreadId(project?.threads[0]?.id ?? "");
+            setSelectedResourceId(resourceId);
+            setViewMode("chat");
+            setRightTab("files");
+            setRightOpen(true);
+            setResourcePreviewOpen(true);
+          }}
+        />
+      )}
+
       {resourcePreviewOpen && selectedResource && (
         <ResourcePreview
           resource={selectedResource}
@@ -813,9 +863,8 @@ function LeftSidebar({
   selectedThreadId,
   activeView,
   onNewThread,
-  onImport,
-  onOpenModels,
-  onOpenTasks,
+  onSearch,
+  onOpenSettings,
   onNewProject,
   onSelectProject,
   onSelectThread,
@@ -825,9 +874,8 @@ function LeftSidebar({
   selectedThreadId: string;
   activeView: ViewMode;
   onNewThread: () => void;
-  onImport: () => void;
-  onOpenModels: () => void;
-  onOpenTasks: () => void;
+  onSearch: () => void;
+  onOpenSettings: () => void;
   onNewProject: () => void;
   onSelectProject: (project: Project) => void;
   onSelectThread: (projectId: string, threadId: string) => void;
@@ -835,16 +883,12 @@ function LeftSidebar({
   return (
     <aside className="left-sidebar">
       <div className="brand-row">
-        <button className="brand-button">
+        <div className="brand-button">
           <span className="brand-mark">
             <Clapperboard size={15} />
           </span>
           <span>漫剧 Agent</span>
-          <ChevronDown size={13} />
-        </button>
-        <button className="icon-button" aria-label="搜索">
-          <Search size={16} />
-        </button>
+        </div>
       </div>
 
       <nav className="primary-nav" aria-label="主要功能">
@@ -852,33 +896,20 @@ function LeftSidebar({
           <SquarePen size={16} />
           <span>新建对话</span>
         </button>
-        <button className="nav-row" onClick={onImport}>
-          <FileUp size={16} />
-          <span>导入小说</span>
-        </button>
-        <button
-          className={`nav-row ${
-            activeView === "models" ? "active" : ""
-          }`}
-          onClick={onOpenModels}
-        >
-          <Boxes size={16} />
-          <span>模型配置</span>
-        </button>
-        <button
-          className={`nav-row ${
-            activeView === "tasks" ? "active" : ""
-          }`}
-          onClick={onOpenTasks}
-        >
-          <Clock3 size={16} />
-          <span>任务队列</span>
+        <button className="nav-row" onClick={onSearch}>
+          <Search size={16} />
+          <span>搜索</span>
+          <kbd className="nav-shortcut">Ctrl K</kbd>
         </button>
       </nav>
 
       <div className="sidebar-section-header">
         <span>项目</span>
-        <button className="icon-button small" onClick={onNewProject}>
+        <button
+          className="icon-button small"
+          onClick={onNewProject}
+          aria-label="新建项目"
+        >
           <Plus size={14} />
         </button>
       </div>
@@ -939,11 +970,16 @@ function LeftSidebar({
         )}
       </div>
 
-      <button className="workspace-profile">
+      <button
+        className={`workspace-profile ${
+          activeView === "settings" ? "active" : ""
+        }`}
+        onClick={onOpenSettings}
+      >
         <span className="profile-avatar">M</span>
         <span>
           <strong>本地工作区</strong>
-          <small>项目数据保存在此电脑</small>
+          <small>设置与模型服务</small>
         </span>
         <Settings size={15} />
       </button>
@@ -962,7 +998,7 @@ function ChatView({
   onSend,
   onCreateProject,
   onImport,
-  onOpenModels,
+  onOpenSettings,
   onToggleRight,
 }: {
   project: Project | null;
@@ -975,7 +1011,7 @@ function ChatView({
   onSend: () => void;
   onCreateProject: () => void;
   onImport: () => void;
-  onOpenModels: () => void;
+  onOpenSettings: () => void;
   onToggleRight: () => void;
 }) {
   return (
@@ -1003,13 +1039,13 @@ function ChatView({
           <EmptyWorkspace
             onCreateProject={onCreateProject}
             onImport={onImport}
-            onOpenModels={onOpenModels}
+            onOpenSettings={onOpenSettings}
           />
         ) : !thread || thread.messages.length === 0 ? (
           <EmptyThread
             projectName={project.name}
             onImport={onImport}
-            onOpenModels={onOpenModels}
+            onOpenSettings={onOpenSettings}
           />
         ) : (
           <div className="message-column">
@@ -1077,9 +1113,9 @@ function ChatView({
               </button>
             </div>
             <div>
-              <button className="composer-action" onClick={onOpenModels}>
-                <Clapperboard size={14} />
-                模型配置
+              <button className="composer-action" onClick={onOpenSettings}>
+                <Settings size={14} />
+                模型设置
               </button>
               <button className="round-button">
                 <Mic size={16} />
@@ -1111,11 +1147,11 @@ function ChatView({
 function EmptyWorkspace({
   onCreateProject,
   onImport,
-  onOpenModels,
+  onOpenSettings,
 }: {
   onCreateProject: () => void;
   onImport: () => void;
-  onOpenModels: () => void;
+  onOpenSettings: () => void;
 }) {
   return (
     <FadeContent className="empty-main-state">
@@ -1133,9 +1169,9 @@ function EmptyWorkspace({
           <Plus size={15} />
           新建项目
         </button>
-        <button className="secondary-button" onClick={onOpenModels}>
+        <button className="secondary-button" onClick={onOpenSettings}>
           <Settings size={15} />
-          配置模型
+          打开设置
         </button>
       </div>
     </FadeContent>
@@ -1145,11 +1181,11 @@ function EmptyWorkspace({
 function EmptyThread({
   projectName,
   onImport,
-  onOpenModels,
+  onOpenSettings,
 }: {
   projectName: string;
   onImport: () => void;
-  onOpenModels: () => void;
+  onOpenSettings: () => void;
 }) {
   return (
     <FadeContent className="empty-main-state compact">
@@ -1163,9 +1199,9 @@ function EmptyThread({
           <FileUp size={15} />
           导入小说
         </button>
-        <button className="secondary-button" onClick={onOpenModels}>
+        <button className="secondary-button" onClick={onOpenSettings}>
           <Settings size={15} />
-          检查模型配置
+          检查模型设置
         </button>
       </div>
     </FadeContent>
@@ -1312,8 +1348,8 @@ function ModelSettingsView({
     <section className="settings-view">
       <header className="center-header">
         <div className="center-title">
-          <strong>模型配置</strong>
-          <span>配置实际用于生产流程的模型服务</span>
+          <strong>设置</strong>
+          <span>本地工作区与模型服务</span>
         </div>
         <button
           className="icon-button"
@@ -1330,7 +1366,8 @@ function ModelSettingsView({
 
       <div className="settings-scroll">
         <SpotlightSurface className="settings-page">
-          <nav className="model-tabs" aria-label="模型类型">
+          <nav className="model-tabs" aria-label="模型服务类型">
+            <div className="settings-nav-label">模型服务</div>
             <ModelTab
               active={activeKind === "chat"}
               enabled={configs.chat.enabled}
@@ -1557,50 +1594,6 @@ function ModelTab({
   );
 }
 
-function TaskQueueView({
-  onBack,
-  rightOpen,
-  onToggleRight,
-}: {
-  onBack: () => void;
-  rightOpen: boolean;
-  onToggleRight: () => void;
-}) {
-  return (
-    <section className="settings-view">
-      <header className="center-header">
-        <div className="center-title">
-          <strong>任务队列</strong>
-          <span>模型生成任务会显示在这里</span>
-        </div>
-        <button
-          className="icon-button"
-          onClick={onToggleRight}
-          aria-label={rightOpen ? "收起资源栏" : "展开资源栏"}
-        >
-          {rightOpen ? (
-            <PanelRightClose size={18} />
-          ) : (
-            <PanelRightOpen size={18} />
-          )}
-        </button>
-      </header>
-      <div className="settings-scroll">
-        <FadeContent className="empty-main-state">
-          <span className="empty-mark">
-            <Clock3 size={21} />
-          </span>
-          <h1>暂无生成任务</h1>
-          <p>当 Agent 开始生成图片或视频时，任务状态会出现在这里。</p>
-          <button className="secondary-button" onClick={onBack}>
-            返回对话
-          </button>
-        </FadeContent>
-      </div>
-    </section>
-  );
-}
-
 function RightSidebar({
   project,
   activeTab,
@@ -1824,6 +1817,215 @@ function StatusToast({ message }: { message: string }) {
         )}
       </span>
       <span>{message}</span>
+    </div>
+  );
+}
+
+function WorkspaceSearchDialog({
+  projects,
+  onClose,
+  onSelectProject,
+  onSelectThread,
+  onSelectResource,
+}: {
+  projects: Project[];
+  onClose: () => void;
+  onSelectProject: (projectId: string) => void;
+  onSelectThread: (projectId: string, threadId: string) => void;
+  onSelectResource: (projectId: string, resourceId: string) => void;
+}) {
+  const [query, setQuery] = useState("");
+  const [activeIndex, setActiveIndex] = useState(0);
+  const [closing, setClosing] = useState(false);
+
+  const allItems = useMemo<WorkspaceSearchItem[]>(
+    () =>
+      projects
+        .flatMap((project) => [
+          {
+            id: `project-${project.id}`,
+            kind: "project" as const,
+            title: project.name,
+            meta: `${project.threads.length} 个对话 · ${project.resources.length} 个文件`,
+            timestamp: project.updatedAt,
+            projectId: project.id,
+          },
+          ...project.threads.map((thread) => ({
+            id: `thread-${thread.id}`,
+            kind: "thread" as const,
+            title: thread.title,
+            meta: project.name,
+            timestamp: thread.updatedAt,
+            projectId: project.id,
+            threadId: thread.id,
+          })),
+          ...project.resources.map((resource) => ({
+            id: `resource-${resource.id}`,
+            kind: "resource" as const,
+            title: resource.name,
+            meta: `${project.name} · ${resource.category}`,
+            timestamp: resource.createdAt,
+            projectId: project.id,
+            resourceId: resource.id,
+            category: resource.category,
+          })),
+        ])
+        .sort((left, right) => right.timestamp - left.timestamp),
+    [projects],
+  );
+
+  const results = useMemo(() => {
+    const normalized = query.trim().toLocaleLowerCase();
+    return allItems
+      .filter(
+        (item) =>
+          !normalized ||
+          item.title.toLocaleLowerCase().includes(normalized) ||
+          item.meta.toLocaleLowerCase().includes(normalized),
+      )
+      .slice(0, 16);
+  }, [allItems, query]);
+
+  useEffect(() => {
+    setActiveIndex(0);
+  }, [query]);
+
+  const requestClose = () => {
+    if (closing) return;
+    setClosing(true);
+    window.setTimeout(onClose, 180);
+  };
+
+  const selectItem = (item: WorkspaceSearchItem) => {
+    if (closing) return;
+    setClosing(true);
+    window.setTimeout(() => {
+      if (item.kind === "project") {
+        onSelectProject(item.projectId);
+      } else if (item.kind === "thread" && item.threadId) {
+        onSelectThread(item.projectId, item.threadId);
+      } else if (item.kind === "resource" && item.resourceId) {
+        onSelectResource(item.projectId, item.resourceId);
+      }
+      onClose();
+    }, 180);
+  };
+
+  return (
+    <div
+      className={`modal-backdrop search-backdrop ${
+        closing ? "closing" : ""
+      }`}
+      onMouseDown={requestClose}
+    >
+      <section
+        className="search-dialog ui-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-label="搜索工作区"
+        onMouseDown={(event) => event.stopPropagation()}
+      >
+        <div className="search-dialog-input">
+          <Search size={19} />
+          <input
+            autoFocus
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Escape") requestClose();
+              if (event.key === "ArrowDown" && results.length > 0) {
+                event.preventDefault();
+                setActiveIndex((index) =>
+                  Math.min(results.length - 1, index + 1),
+                );
+              }
+              if (event.key === "ArrowUp" && results.length > 0) {
+                event.preventDefault();
+                setActiveIndex((index) => Math.max(0, index - 1));
+              }
+              if (event.key === "Enter" && results[activeIndex]) {
+                event.preventDefault();
+                selectItem(results[activeIndex]);
+              }
+            }}
+            placeholder="搜索项目、对话和文件"
+            aria-label="搜索项目、对话和文件"
+          />
+          <kbd>Esc</kbd>
+        </div>
+
+        <div className="search-results" role="listbox">
+          {results.length === 0 ? (
+            <FadeContent className="search-empty">
+              <Search size={22} />
+              <strong>
+                {projects.length === 0
+                  ? "工作区还没有可搜索内容"
+                  : "没有找到相关内容"}
+              </strong>
+              <span>
+                {projects.length === 0
+                  ? "创建项目或导入小说后，可在这里快速查找"
+                  : "尝试输入其他项目、对话或文件名称"}
+              </span>
+            </FadeContent>
+          ) : (
+            <>
+              <div className="search-results-label">
+                {query.trim() ? "搜索结果" : "最近内容"}
+                <span>{results.length}</span>
+              </div>
+              <AnimatedList className="search-results-list">
+                {results.map((item, index) => (
+                  <button
+                    key={item.id}
+                    className={
+                      index === activeIndex ? "active" : ""
+                    }
+                    role="option"
+                    aria-selected={index === activeIndex}
+                    onMouseEnter={() => setActiveIndex(index)}
+                    onClick={() => selectItem(item)}
+                  >
+                    <span className="search-result-icon">
+                      {item.kind === "project" ? (
+                        <Folder size={17} />
+                      ) : item.kind === "thread" ? (
+                        <MessageSquareText size={17} />
+                      ) : (
+                        <ResourceIcon category={item.category ?? "原著"} />
+                      )}
+                    </span>
+                    <span className="search-result-copy">
+                      <strong>{item.title}</strong>
+                      <small>{item.meta}</small>
+                    </span>
+                    <span className="search-result-kind">
+                      {item.kind === "project"
+                        ? "项目"
+                        : item.kind === "thread"
+                          ? "对话"
+                          : "文件"}
+                    </span>
+                  </button>
+                ))}
+              </AnimatedList>
+            </>
+          )}
+        </div>
+
+        <footer className="search-dialog-footer">
+          <span>
+            <kbd>↑</kbd>
+            <kbd>↓</kbd>
+            选择
+          </span>
+          <span>
+            <kbd>Enter</kbd>
+            打开
+          </span>
+        </footer>
+      </section>
     </div>
   );
 }
