@@ -230,20 +230,24 @@ button:focus-visible {
 
 .workspace.right-open {
   grid-template-columns:
-    272px minmax(0, 1fr)
+    var(--left-panel-width, 272px) minmax(0, 1fr)
     var(--right-panel-width, 360px);
 }
 
 .workspace.right-closed {
-  grid-template-columns: 272px minmax(0, 1fr) 0;
+  grid-template-columns:
+    var(--left-panel-width, 272px) minmax(0, 1fr)
+    0;
 }
 
-.workspace.right-resizing {
+.workspace.right-resizing,
+.workspace.left-resizing {
   cursor: col-resize;
   transition: none;
 }
 
-.workspace.right-resizing * {
+.workspace.right-resizing *,
+.workspace.left-resizing * {
   cursor: col-resize !important;
   user-select: none !important;
 }
@@ -273,6 +277,7 @@ button:focus-visible {
 }
 
 .left-sidebar {
+  position: relative;
   min-width: 0;
   min-height: 0;
   display: grid;
@@ -283,10 +288,12 @@ button:focus-visible {
 }
 
 .brand-row {
+  position: relative;
+  z-index: 40;
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 0 10px 0 15px;
+  padding: 0 8px;
 }
 
 .brand-button {
@@ -295,7 +302,7 @@ button:focus-visible {
   display: flex;
   align-items: center;
   gap: 4px;
-  padding: 0;
+  padding: 0 7px;
   border: 0;
   border-radius: 6px;
   color: #272d33;
@@ -306,9 +313,19 @@ button:focus-visible {
 }
 
 .brand-button:hover,
+.brand-button.active,
 .sidebar-search-button:hover {
   color: #20262b;
   background: rgb(209 219 227 / 55%);
+}
+
+.brand-button svg {
+  flex: 0 0 auto;
+  transition: transform var(--motion-base) ease;
+}
+
+.brand-button svg.open {
+  transform: rotate(180deg);
 }
 
 .brand-button span {
@@ -328,6 +345,142 @@ button:focus-visible {
   color: #65717b;
   background: transparent;
   cursor: pointer;
+}
+
+.brand-workspace-menu {
+  width: calc(var(--left-panel-width, 272px) - 16px);
+  position: absolute;
+  z-index: 50;
+  top: 42px;
+  left: 0;
+  padding: 6px;
+  overflow: hidden;
+  border: 1px solid #d5dde4;
+  border-radius: 12px;
+  background: rgb(255 255 255 / 98%);
+  box-shadow:
+    0 18px 48px rgb(31 40 49 / 18%),
+    0 2px 8px rgb(31 40 49 / 8%);
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transform: translateY(-4px) scale(0.98);
+  transform-origin: top left;
+  transition:
+    opacity 120ms ease,
+    transform 140ms cubic-bezier(0.2, 0.8, 0.2, 1),
+    visibility 0s linear 140ms;
+}
+
+.brand-workspace-menu.open {
+  opacity: 1;
+  visibility: visible;
+  pointer-events: auto;
+  transform: translateY(0) scale(1);
+  transition-delay: 0s;
+}
+
+.brand-menu-heading {
+  display: flex;
+  flex-direction: column;
+  padding: 8px 9px 7px;
+}
+
+.brand-menu-heading strong {
+  color: #30373d;
+  font-size: 13.5px;
+  font-weight: 650;
+}
+
+.brand-menu-heading span {
+  margin-top: 3px;
+  color: #8a939b;
+  font-size: 11px;
+}
+
+.brand-menu-current {
+  min-width: 0;
+  height: 48px;
+  display: grid;
+  grid-template-columns: 26px minmax(0, 1fr) 18px;
+  align-items: center;
+  gap: 8px;
+  padding: 0 9px;
+  border-radius: 8px;
+  color: #3c454d;
+  background: #f2f5f7;
+}
+
+.brand-menu-avatar {
+  width: 24px;
+  height: 24px;
+  display: grid;
+  place-items: center;
+  border: 1px solid #c9d8f3;
+  border-radius: 50%;
+  color: #2f6fdb;
+  background: #eaf2ff;
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.brand-menu-current > span:nth-child(2) {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.brand-menu-current strong {
+  overflow: hidden;
+  font-size: 12.5px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.brand-menu-current small {
+  margin-top: 2px;
+  color: #8a939b;
+  font-size: 10.5px;
+}
+
+.brand-menu-current > svg {
+  color: #4775c2;
+}
+
+.brand-menu-divider {
+  height: 1px;
+  margin: 6px 3px;
+  background: #e5e9ed;
+}
+
+.brand-workspace-menu > button {
+  width: 100%;
+  height: 38px;
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  padding: 0 9px;
+  border: 0;
+  border-radius: 8px;
+  color: #414a52;
+  background: transparent;
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.brand-workspace-menu > button:hover,
+.brand-workspace-menu > button:focus-visible {
+  color: #2457a8;
+  background: #edf3ff;
+}
+
+.brand-workspace-menu > button kbd {
+  color: #929aa2;
+  font-family: inherit;
+  font-size: 10px;
 }
 
 .primary-nav {
@@ -1564,6 +1717,60 @@ button:focus-visible {
   touch-action: none;
 }
 
+.left-resize-handle {
+  width: 10px;
+  position: absolute;
+  z-index: 45;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  cursor: col-resize;
+  touch-action: none;
+}
+
+.left-resize-handle::before {
+  width: 4px;
+  height: 30px;
+  position: absolute;
+  top: 50%;
+  right: 3px;
+  content: "";
+  border-radius: 999px;
+  background: #c3cfdb;
+  opacity: 0;
+  transform: translateY(-50%);
+  transition:
+    height var(--motion-base) ease,
+    background var(--motion-fast) ease,
+    opacity var(--motion-fast) ease;
+}
+
+.left-resize-handle::after {
+  width: 2px;
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  content: "";
+  background: transparent;
+  transition:
+    width var(--motion-fast) ease,
+    background var(--motion-fast) ease;
+}
+
+.left-resize-handle:hover::after,
+.workspace.left-resizing .left-resize-handle::after {
+  width: 3px;
+  background: var(--accent);
+}
+
+.left-resize-handle:hover::before,
+.workspace.left-resizing .left-resize-handle::before {
+  height: 42px;
+  background: var(--accent);
+  opacity: 1;
+}
+
 .right-resize-handle::before {
   width: 4px;
   height: 30px;
@@ -1632,6 +1839,22 @@ button:focus-visible {
 .right-resize-handle:hover .resize-tooltip {
   opacity: 1;
   transform: translate(0, -50%);
+}
+
+.resize-tooltip.left-tooltip {
+  right: auto;
+  left: 16px;
+  transform: translate(-5px, -50%);
+}
+
+.left-resize-handle:hover .resize-tooltip {
+  opacity: 1;
+  transform: translate(0, -50%);
+}
+
+.left-resize-handle:focus-visible::after {
+  width: 3px;
+  background: var(--accent);
 }
 
 .right-sidebar.closed {
@@ -2993,12 +3216,14 @@ button:focus-visible {
 @media (max-width: 1220px) {
   .workspace.right-open {
     grid-template-columns:
-      238px minmax(0, 1fr)
+      var(--left-panel-width, 238px) minmax(0, 1fr)
       var(--right-panel-width, 320px);
   }
 
   .workspace.right-closed {
-    grid-template-columns: 238px minmax(0, 1fr) 0;
+    grid-template-columns:
+      var(--left-panel-width, 238px) minmax(0, 1fr)
+      0;
   }
 
   .settings-page {

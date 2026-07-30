@@ -137,6 +137,10 @@ type SidebarPreferences = {
 };
 
 const emptyWorkspace: WorkspaceState = { projects: [], threads: [] };
+const defaultLeftPanelWidth = 272;
+const minLeftPanelWidth = 232;
+const maxLeftPanelWidth = 380;
+const minCenterPanelWidth = 520;
 const defaultSidebarPreferences: SidebarPreferences = {
   collapsedSections: [],
   collapsedProjectIds: [],
@@ -385,12 +389,17 @@ function App() {
     "manju-agent-right-panel-v2",
     true,
   );
+  const [leftWidth, setLeftWidth] = useStoredState(
+    "manju-agent-left-width-v1",
+    defaultLeftPanelWidth,
+  );
   const [rightWidth, setRightWidth] = useStoredState(
     "manju-agent-right-width-v2",
     380,
   );
   const [lastSelectedThreadId, setLastSelectedThreadId] =
     useStoredState("manju-agent-last-thread-v1", "");
+  const [leftResizing, setLeftResizing] = useState(false);
   const [rightResizing, setRightResizing] = useState(false);
   const [selectedThreadId, setSelectedThreadId] = useState(() => {
     if (
@@ -425,17 +434,49 @@ function App() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const composerRef = useRef<HTMLTextAreaElement>(null);
 
-  const clampRightWidth = (width: number) => {
+  const clampLeftWidth = (
+    width: number,
+    currentRightWidth = rightOpen ? rightWidth : 0,
+  ) => {
+    const viewportLimit = Math.max(
+      minLeftPanelWidth,
+      Math.min(
+        maxLeftPanelWidth,
+        window.innerWidth -
+          currentRightWidth -
+          minCenterPanelWidth,
+      ),
+    );
+    return Math.round(
+      Math.max(
+        minLeftPanelWidth,
+        Math.min(viewportLimit, width),
+      ),
+    );
+  };
+
+  const clampRightWidth = (
+    width: number,
+    currentLeftWidth = leftWidth,
+  ) => {
     const viewportLimit = Math.max(
       300,
-      Math.min(640, window.innerWidth - 740),
+      Math.min(
+        640,
+        window.innerWidth -
+          currentLeftWidth -
+          minCenterPanelWidth,
+      ),
     );
     return Math.round(Math.max(300, Math.min(viewportLimit, width)));
   };
 
   useEffect(() => {
     const handleResize = () => {
-      setRightWidth((width) => clampRightWidth(width));
+      setLeftWidth((width) =>
+        clampLeftWidth(width, rightOpen ? rightWidth : 0),
+      );
+      setRightWidth((width) => clampRightWidth(width, leftWidth));
     };
     const frame = window.requestAnimationFrame(handleResize);
     window.addEventListener("resize", handleResize);
@@ -443,7 +484,37 @@ function App() {
       window.cancelAnimationFrame(frame);
       window.removeEventListener("resize", handleResize);
     };
-  }, []);
+  }, [leftWidth, rightOpen, rightWidth, setLeftWidth, setRightWidth]);
+
+  const startLeftResize = (
+    event: ReactPointerEvent<HTMLDivElement>,
+  ) => {
+    event.preventDefault();
+
+    const startX = event.clientX;
+    const startWidth = leftWidth;
+    setLeftResizing(true);
+
+    const handlePointerMove = (moveEvent: PointerEvent) => {
+      setLeftWidth(
+        clampLeftWidth(
+          startWidth + moveEvent.clientX - startX,
+          rightOpen ? rightWidth : 0,
+        ),
+      );
+    };
+
+    const finishResize = () => {
+      setLeftResizing(false);
+      window.removeEventListener("pointermove", handlePointerMove);
+      window.removeEventListener("pointerup", finishResize);
+      window.removeEventListener("pointercancel", finishResize);
+    };
+
+    window.addEventListener("pointermove", handlePointerMove);
+    window.addEventListener("pointerup", finishResize);
+    window.addEventListener("pointercancel", finishResize);
+  };
 
   const startRightResize = (
     event: ReactPointerEvent<HTMLDivElement>,
@@ -916,9 +987,12 @@ function App() {
       <div
         className={`workspace ${
           rightOpen ? "right-open" : "right-closed"
-        } ${rightResizing ? "right-resizing" : ""}`}
+        } ${rightResizing ? "right-resizing" : ""} ${
+          leftResizing ? "left-resizing" : ""
+        }`}
         style={
           {
+            "--left-panel-width": `${leftWidth}px`,
             "--right-panel-width": `${rightWidth}px`,
           } as CSSProperties
         }
@@ -931,6 +1005,25 @@ function App() {
           onNewThread={createNewThread}
           onSearch={() => setSearchDialogOpen(true)}
           onOpenSettings={() => setSettingsDialogOpen(true)}
+          onChooseFolder={() => void chooseProjectFolder()}
+          width={leftWidth}
+          onResizeStart={startLeftResize}
+          onResetWidth={() =>
+            setLeftWidth(
+              clampLeftWidth(
+                defaultLeftPanelWidth,
+                rightOpen ? rightWidth : 0,
+              ),
+            )
+          }
+          onAdjustWidth={(delta) =>
+            setLeftWidth((current) =>
+              clampLeftWidth(
+                current + delta,
+                rightOpen ? rightWidth : 0,
+              ),
+            )
+          }
           onToggleThreadPinned={toggleThreadPinned}
           onSelectThread={(threadId) => {
             setSelectedThreadId(threadId);
@@ -1046,9 +1139,14 @@ function LeftSidebar({
   threads,
   selectedThreadId,
   settingsActive,
+  width,
   onNewThread,
   onSearch,
   onOpenSettings,
+  onChooseFolder,
+  onResizeStart,
+  onResetWidth,
+  onAdjustWidth,
   onToggleThreadPinned,
   onSelectThread,
 }: {
@@ -1056,9 +1154,14 @@ function LeftSidebar({
   threads: Thread[];
   selectedThreadId: string;
   settingsActive: boolean;
+  width: number;
   onNewThread: () => void;
   onSearch: () => void;
   onOpenSettings: () => void;
+  onChooseFolder: () => void;
+  onResizeStart: (event: ReactPointerEvent<HTMLDivElement>) => void;
+  onResetWidth: () => void;
+  onAdjustWidth: (delta: number) => void;
   onToggleThreadPinned: (threadId: string) => void;
   onSelectThread: (threadId: string) => void;
 }) {
@@ -1067,13 +1170,19 @@ function LeftSidebar({
       "manju-agent-sidebar-preferences-v1",
       defaultSidebarPreferences,
     );
+  const [brandMenuOpen, setBrandMenuOpen] = useState(false);
   const [threadMenu, setThreadMenu] = useState<{
     threadId: string;
     left: number;
     top: number;
   } | null>(null);
+  const brandButtonRef = useRef<HTMLButtonElement>(null);
+  const brandMenuRef = useRef<HTMLDivElement>(null);
   const selectedThread = threads.find(
     (thread) => thread.id === selectedThreadId,
+  );
+  const selectedProject = projects.find(
+    (project) => project.id === selectedThread?.projectId,
   );
   const pinnedThreads = threads
     .filter((thread) => thread.pinnedAt !== null)
@@ -1141,6 +1250,37 @@ function LeftSidebar({
     selectedThread?.projectId,
     setPreferences,
   ]);
+
+  useEffect(() => {
+    if (!brandMenuOpen) return;
+    const closeMenu = (event: PointerEvent) => {
+      if (
+        !(event.target as HTMLElement).closest(
+          "[data-sidebar-brand-menu]",
+        )
+      ) {
+        setBrandMenuOpen(false);
+      }
+    };
+    const handleKeydown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setBrandMenuOpen(false);
+        brandButtonRef.current?.focus();
+      }
+    };
+    const frame = window.requestAnimationFrame(() => {
+      brandMenuRef.current
+        ?.querySelector<HTMLButtonElement>("button")
+        ?.focus();
+    });
+    window.addEventListener("pointerdown", closeMenu);
+    window.addEventListener("keydown", handleKeydown);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      window.removeEventListener("pointerdown", closeMenu);
+      window.removeEventListener("keydown", handleKeydown);
+    };
+  }, [brandMenuOpen]);
 
   useEffect(() => {
     if (!threadMenu) return;
@@ -1215,12 +1355,37 @@ function LeftSidebar({
     </div>
   );
 
+  const runBrandAction = (action: () => void) => {
+    setBrandMenuOpen(false);
+    action();
+  };
+
   return (
     <aside className="left-sidebar">
       <div className="brand-row">
-        <button className="brand-button" aria-label="漫剧 Agent 工作区">
+        <button
+          ref={brandButtonRef}
+          className={`brand-button ${
+            brandMenuOpen ? "active" : ""
+          }`}
+          data-sidebar-brand-menu
+          aria-label="漫剧 Agent 工作区"
+          aria-haspopup="menu"
+          aria-expanded={brandMenuOpen}
+          aria-controls="brand-workspace-menu"
+          onClick={() => setBrandMenuOpen((open) => !open)}
+          onKeyDown={(event) => {
+            if (event.key === "ArrowDown") {
+              event.preventDefault();
+              setBrandMenuOpen(true);
+            }
+          }}
+        >
           <span>漫剧 Agent</span>
-          <ChevronDown size={14} />
+          <ChevronDown
+            size={14}
+            className={brandMenuOpen ? "open" : ""}
+          />
         </button>
         <button
           className="sidebar-search-button"
@@ -1230,6 +1395,107 @@ function LeftSidebar({
         >
           <Search size={16} />
         </button>
+
+        <div
+          id="brand-workspace-menu"
+          ref={brandMenuRef}
+          className={`brand-workspace-menu ${
+            brandMenuOpen ? "open" : ""
+          }`}
+          data-sidebar-brand-menu
+          role="menu"
+          aria-label="工作区菜单"
+          aria-hidden={!brandMenuOpen}
+          onKeyDown={(event) => {
+            const items = Array.from(
+              event.currentTarget.querySelectorAll<HTMLButtonElement>(
+                "button",
+              ),
+            );
+            const currentIndex = items.indexOf(
+              document.activeElement as HTMLButtonElement,
+            );
+            if (event.key === "ArrowDown") {
+              event.preventDefault();
+              items[(currentIndex + 1 + items.length) % items.length]
+                ?.focus();
+            }
+            if (event.key === "ArrowUp") {
+              event.preventDefault();
+              items[
+                (currentIndex - 1 + items.length) % items.length
+              ]?.focus();
+            }
+            if (event.key === "Home") {
+              event.preventDefault();
+              items[0]?.focus();
+            }
+            if (event.key === "End") {
+              event.preventDefault();
+              items.at(-1)?.focus();
+            }
+            if (event.key === "Tab") {
+              setBrandMenuOpen(false);
+            }
+          }}
+        >
+          <div className="brand-menu-heading">
+            <strong>漫剧 Agent</strong>
+            <span>小说 → 分镜 → 漫画 → 漫剧</span>
+          </div>
+          <div className="brand-menu-current">
+            <span className="brand-menu-avatar">
+              <FolderOpen size={14} />
+            </span>
+            <span>
+              <strong>
+                {selectedProject?.name ?? "未绑定项目文件夹"}
+              </strong>
+              <small>
+                {selectedProject
+                  ? "当前任务的项目上下文"
+                  : "当前任务可直接开始对话"}
+              </small>
+            </span>
+            {selectedProject && <Check size={16} />}
+          </div>
+          <div className="brand-menu-divider" />
+          <button
+            role="menuitem"
+            tabIndex={brandMenuOpen ? 0 : -1}
+            onClick={() => runBrandAction(onNewThread)}
+          >
+            <SquarePen size={16} />
+            <span>新建任务</span>
+          </button>
+          <button
+            role="menuitem"
+            tabIndex={brandMenuOpen ? 0 : -1}
+            onClick={() => runBrandAction(onSearch)}
+          >
+            <Search size={16} />
+            <span>搜索任务</span>
+            <kbd>Ctrl K</kbd>
+          </button>
+          <button
+            role="menuitem"
+            tabIndex={brandMenuOpen ? 0 : -1}
+            onClick={() => runBrandAction(onChooseFolder)}
+          >
+            <FolderOpen size={16} />
+            <span>
+              {selectedProject ? "更换项目文件夹" : "选择项目文件夹"}
+            </span>
+          </button>
+          <button
+            role="menuitem"
+            tabIndex={brandMenuOpen ? 0 : -1}
+            onClick={() => runBrandAction(onOpenSettings)}
+          >
+            <Settings size={16} />
+            <span>设置</span>
+          </button>
+        </div>
       </div>
 
       <nav className="primary-nav" aria-label="主要功能">
@@ -1391,6 +1657,41 @@ function LeftSidebar({
         <strong>本地工作区</strong>
         <CircleHelp size={16} />
       </button>
+
+      <div
+        className="left-resize-handle"
+        role="separator"
+        aria-label="调整左侧栏宽度"
+        aria-orientation="vertical"
+        aria-valuemin={minLeftPanelWidth}
+        aria-valuemax={maxLeftPanelWidth}
+        aria-valuenow={width}
+        tabIndex={0}
+        onPointerDown={onResizeStart}
+        onDoubleClick={onResetWidth}
+        onKeyDown={(event) => {
+          if (event.key === "ArrowLeft") {
+            event.preventDefault();
+            onAdjustWidth(event.shiftKey ? -24 : -8);
+          }
+          if (event.key === "ArrowRight") {
+            event.preventDefault();
+            onAdjustWidth(event.shiftKey ? 24 : 8);
+          }
+          if (event.key === "Home") {
+            event.preventDefault();
+            onAdjustWidth(minLeftPanelWidth - width);
+          }
+          if (event.key === "End") {
+            event.preventDefault();
+            onAdjustWidth(maxLeftPanelWidth - width);
+          }
+        }}
+      >
+        <span className="resize-tooltip left-tooltip">
+          拖动调整宽度 · 双击恢复默认
+        </span>
+      </div>
 
       {threadMenu && (
         <div
