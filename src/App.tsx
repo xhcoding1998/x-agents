@@ -126,6 +126,13 @@ type ModelProviderPreset = {
   modelPlaceholder: string;
 };
 
+type ModelCatalogState = {
+  provider: string;
+  loading: boolean;
+  models: string[];
+  error: string;
+};
+
 type WorkspaceSearchItem = {
   id: string;
   kind: "project" | "thread" | "resource";
@@ -153,6 +160,12 @@ const minCenterPanelWidth = 520;
 const defaultSidebarPreferences: SidebarPreferences = {
   collapsedSections: [],
   collapsedProjectIds: [],
+};
+
+const emptyModelCatalogs: Record<ModelKind, ModelCatalogState> = {
+  chat: { provider: "", loading: false, models: [], error: "" },
+  image: { provider: "", loading: false, models: [], error: "" },
+  video: { provider: "", loading: false, models: [], error: "" },
 };
 
 const modelProviderPresets: Record<
@@ -591,6 +604,10 @@ function App() {
     kind?: "success" | "error";
     text?: string;
   }>({ loading: false });
+  const [modelCatalogs, setModelCatalogs] =
+    useState<Record<ModelKind, ModelCatalogState>>(
+      emptyModelCatalogs,
+    );
   const fileInputRef = useRef<HTMLInputElement>(null);
   const composerRef = useRef<HTMLTextAreaElement>(null);
 
@@ -1034,6 +1051,24 @@ function App() {
       ...current,
       [kind]: { ...current[kind], [key]: value },
     }));
+    if (
+      ["provider", "baseUrl", "apiKey", "headers"].includes(
+        String(key),
+      )
+    ) {
+      setModelCatalogs((current) => ({
+        ...current,
+        [kind]: {
+          provider:
+            key === "provider"
+              ? String(value)
+              : modelConfigs[kind].provider,
+          loading: false,
+          models: [],
+          error: "",
+        },
+      }));
+    }
     setTestState({ loading: false });
   };
 
@@ -1068,6 +1103,77 @@ function App() {
         kind: "error",
         text: String(error),
       });
+    }
+  };
+
+  const fetchProviderModels = async (kind: ModelKind) => {
+    const config = modelConfigs[kind];
+    if (!config.baseUrl.trim()) {
+      setModelCatalogs((current) => ({
+        ...current,
+        [kind]: {
+          provider: config.provider,
+          loading: false,
+          models: [],
+          error: "请先选择供应商或填写 Base URL",
+        },
+      }));
+      return;
+    }
+    if (
+      !config.apiKey.trim() &&
+      !config.provider.includes("自定义")
+    ) {
+      setModelCatalogs((current) => ({
+        ...current,
+        [kind]: {
+          provider: config.provider,
+          loading: false,
+          models: [],
+          error: "请先填写 API Key",
+        },
+      }));
+      return;
+    }
+
+    setModelCatalogs((current) => ({
+      ...current,
+      [kind]: {
+        provider: config.provider,
+        loading: true,
+        models: [],
+        error: "",
+      },
+    }));
+
+    try {
+      const { invoke } = await import("@tauri-apps/api/core");
+      const models = await invoke<string[]>("list_provider_models", {
+        provider: config.provider,
+        modelKind: kind,
+        baseUrl: config.baseUrl,
+        apiKey: config.apiKey,
+        headersJson: config.headers,
+      });
+      setModelCatalogs((current) => ({
+        ...current,
+        [kind]: {
+          provider: config.provider,
+          loading: false,
+          models,
+          error: "",
+        },
+      }));
+    } catch (error) {
+      setModelCatalogs((current) => ({
+        ...current,
+        [kind]: {
+          provider: config.provider,
+          loading: false,
+          models: [],
+          error: String(error),
+        },
+      }));
     }
   };
 
@@ -1271,6 +1377,7 @@ function App() {
       {settingsDialogOpen && (
         <SettingsDialog
           configs={modelConfigs}
+          modelCatalogs={modelCatalogs}
           activeKind={activeModelKind}
           testState={testState}
           projectCount={workspace.projects.length}
@@ -1279,6 +1386,7 @@ function App() {
           onChangeKind={setActiveModelKind}
           onChange={updateModelConfig}
           onTest={() => void testModelConnection()}
+          onFetchModels={(kind) => void fetchProviderModels(kind)}
           onSaved={() => setToast("模型设置已保存在本机")}
         />
       )}
@@ -2172,8 +2280,139 @@ function CustomSelect({
   );
 }
 
+function ModelPicker({
+  value,
+  options,
+  placeholder,
+  loading,
+  error,
+  onChange,
+  onFetch,
+}: {
+  value: string;
+  options: string[];
+  placeholder: string;
+  loading: boolean;
+  error: string;
+  onChange: (value: string) => void;
+  onFetch: () => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const rootRef = useRef<HTMLDivElement>(null);
+  const menuId = useRef(`model-picker-${createId()}`).current;
+
+  useEffect(() => {
+    if (options.length > 0) setOpen(true);
+  }, [options]);
+
+  useEffect(() => {
+    if (!open) return;
+    const handlePointerDown = (event: PointerEvent) => {
+      if (!rootRef.current?.contains(event.target as Node)) {
+        setOpen(false);
+      }
+    };
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setOpen(false);
+    };
+    document.addEventListener("pointerdown", handlePointerDown);
+    window.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.removeEventListener("pointerdown", handlePointerDown);
+      window.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [open]);
+
+  return (
+    <div
+      ref={rootRef}
+      className={`model-id-picker ${open ? "open" : ""}`}
+    >
+      <div className="field-title-row">
+        <span>模型 ID</span>
+        <button
+          type="button"
+          className="model-fetch-button"
+          onClick={onFetch}
+          disabled={loading}
+        >
+          <RotateCcw
+            size={13}
+            className={loading ? "spin" : ""}
+          />
+          {loading ? "正在拉取" : "拉取模型"}
+        </button>
+      </div>
+      <div className="model-id-picker-control">
+        <input
+          value={value}
+          aria-label="模型 ID"
+          placeholder={placeholder}
+          spellCheck={false}
+          onChange={(event) => onChange(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === "ArrowDown" && options.length > 0) {
+              event.preventDefault();
+              setOpen(true);
+            }
+          }}
+        />
+        {options.length > 0 && (
+          <button
+            type="button"
+            className="model-id-picker-toggle"
+            aria-label="选择已拉取模型"
+            aria-haspopup="listbox"
+            aria-expanded={open}
+            aria-controls={menuId}
+            onClick={() => setOpen((current) => !current)}
+          >
+            <ChevronDown size={16} />
+          </button>
+        )}
+      </div>
+      <div
+        id={menuId}
+        className="model-id-picker-menu"
+        role="listbox"
+        aria-label="可用模型"
+        aria-hidden={!open}
+      >
+        {options.map((model) => (
+          <button
+            key={model}
+            type="button"
+            role="option"
+            aria-selected={model === value}
+            className={model === value ? "active" : ""}
+            tabIndex={open ? 0 : -1}
+            onClick={() => {
+              onChange(model);
+              setOpen(false);
+            }}
+          >
+            <span>{model}</span>
+            {model === value && <Check size={16} />}
+          </button>
+        ))}
+      </div>
+      <small
+        className={`field-hint ${
+          error ? "model-fetch-error" : ""
+        }`}
+      >
+        {error ||
+          (options.length > 0
+            ? `已拉取 ${options.length} 个可用模型，也可以手动填写`
+            : "填写 API Key 后可拉取当前账号的可用模型")}
+      </small>
+    </div>
+  );
+}
+
 function SettingsDialog({
   configs,
+  modelCatalogs,
   activeKind,
   testState,
   projectCount,
@@ -2182,9 +2421,11 @@ function SettingsDialog({
   onChangeKind,
   onChange,
   onTest,
+  onFetchModels,
   onSaved,
 }: {
   configs: ModelConfigs;
+  modelCatalogs: Record<ModelKind, ModelCatalogState>;
   activeKind: ModelKind;
   testState: {
     loading: boolean;
@@ -2201,11 +2442,22 @@ function SettingsDialog({
     value: ModelConfig[K],
   ) => void;
   onTest: () => void;
+  onFetchModels: (kind: ModelKind) => void;
   onSaved: () => void;
 }) {
   const [section, setSection] = useState<"models" | "data">("models");
   const [closing, setClosing] = useState(false);
+  const [advancedOpen, setAdvancedOpen] = useState(false);
   const config = configs[activeKind];
+  const currentCatalog =
+    modelCatalogs[activeKind].provider === config.provider
+      ? modelCatalogs[activeKind]
+      : {
+          provider: config.provider,
+          loading: false,
+          models: [],
+          error: "",
+        };
   const providerPresets = modelProviderPresets[activeKind];
   const selectedProviderPreset =
     providerPresets.find(
@@ -2235,6 +2487,7 @@ function SettingsDialog({
     onChange(activeKind, "baseUrl", preset.baseUrl);
     onChange(activeKind, "apiPath", preset.apiPath);
     onChange(activeKind, "headers", preset.headers);
+    if (provider.includes("自定义")) setAdvancedOpen(true);
   };
   const requestClose = () => {
     if (closing) return;
@@ -2346,7 +2599,7 @@ function SettingsDialog({
                   </div>
 
                   <div className="form-grid">
-                    <div className="field">
+                    <div className="field span-2">
                       <span>服务厂商</span>
                       <CustomSelect
                         label="服务厂商"
@@ -2358,44 +2611,6 @@ function SettingsDialog({
                         {selectedProviderPreset.description}
                       </small>
                     </div>
-
-                    <label className="field">
-                      <span>模型 ID</span>
-                      <input
-                        value={config.model}
-                        onChange={(event) =>
-                          onChange(activeKind, "model", event.target.value)
-                        }
-                        placeholder={
-                          selectedProviderPreset.modelPlaceholder
-                        }
-                        spellCheck={false}
-                      />
-                    </label>
-
-                    <label className="field span-2">
-                      <span>Base URL</span>
-                      <input
-                        value={config.baseUrl}
-                        onChange={(event) =>
-                          onChange(activeKind, "baseUrl", event.target.value)
-                        }
-                        placeholder="https://api.example.com/v1"
-                        spellCheck={false}
-                      />
-                    </label>
-
-                    <label className="field span-2">
-                      <span>请求路径</span>
-                      <input
-                        value={config.apiPath}
-                        onChange={(event) =>
-                          onChange(activeKind, "apiPath", event.target.value)
-                        }
-                        placeholder="例如：chat/completions"
-                        spellCheck={false}
-                      />
-                    </label>
 
                     <label className="field span-2">
                       <span>API Key</span>
@@ -2414,18 +2629,98 @@ function SettingsDialog({
                       </div>
                     </label>
 
-                    <label className="field span-2">
-                      <span>自定义请求头（JSON）</span>
-                      <textarea
-                        value={config.headers}
-                        onChange={(event) =>
-                          onChange(activeKind, "headers", event.target.value)
+                    <div className="field span-2">
+                      <ModelPicker
+                        value={config.model}
+                        options={currentCatalog.models}
+                        placeholder={
+                          selectedProviderPreset.modelPlaceholder
                         }
-                        rows={3}
-                        spellCheck={false}
-                        placeholder='{"X-Custom-Header":"value"}'
+                        loading={currentCatalog.loading}
+                        error={currentCatalog.error}
+                        onChange={(value) =>
+                          onChange(activeKind, "model", value)
+                        }
+                        onFetch={() => onFetchModels(activeKind)}
                       />
-                    </label>
+                    </div>
+
+                    <button
+                      type="button"
+                      className={`advanced-config-toggle span-2 ${
+                        advancedOpen ? "open" : ""
+                      }`}
+                      aria-expanded={advancedOpen}
+                      onClick={() =>
+                        setAdvancedOpen((current) => !current)
+                      }
+                    >
+                      <span>
+                        <Settings size={14} />
+                        高级配置
+                      </span>
+                      <small>Base URL、请求路径与自定义请求头</small>
+                      <ChevronDown size={16} />
+                    </button>
+
+                    <div
+                      className={`advanced-config-panel span-2 ${
+                        advancedOpen ? "open" : ""
+                      }`}
+                      aria-hidden={!advancedOpen}
+                      inert={!advancedOpen}
+                    >
+                      <div className="advanced-config-inner form-grid">
+                        <label className="field">
+                          <span>Base URL</span>
+                          <input
+                            value={config.baseUrl}
+                            onChange={(event) =>
+                              onChange(
+                                activeKind,
+                                "baseUrl",
+                                event.target.value,
+                              )
+                            }
+                            placeholder="https://api.example.com/v1"
+                            spellCheck={false}
+                          />
+                        </label>
+
+                        <label className="field">
+                          <span>请求路径</span>
+                          <input
+                            value={config.apiPath}
+                            onChange={(event) =>
+                              onChange(
+                                activeKind,
+                                "apiPath",
+                                event.target.value,
+                              )
+                            }
+                            placeholder="例如：chat/completions"
+                            spellCheck={false}
+                          />
+                        </label>
+
+                        <label className="field span-2">
+                          <span>自定义请求头（JSON）</span>
+                          <textarea
+                            value={config.headers}
+                            onChange={(event) =>
+                              onChange(
+                                activeKind,
+                                "headers",
+                                event.target.value,
+                              )
+                            }
+                            rows={3}
+                            spellCheck={false}
+                            placeholder='{"X-Custom-Header":"value"}'
+                          />
+                        </label>
+                      </div>
+                    </div>
                   </div>
 
                   <div className="model-form-actions">

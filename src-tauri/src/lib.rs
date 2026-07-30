@@ -20,11 +20,7 @@ fn has_custom_header(headers_json: &str, expected: &str) -> bool {
     serde_json::from_str::<Value>(headers_json.trim())
         .ok()
         .and_then(|value| value.as_object().cloned())
-        .is_some_and(|headers| {
-            headers
-                .keys()
-                .any(|key| key.eq_ignore_ascii_case(expected))
-        })
+        .is_some_and(|headers| headers.keys().any(|key| key.eq_ignore_ascii_case(expected)))
 }
 
 fn http_client() -> Result<reqwest::Client, String> {
@@ -79,9 +75,7 @@ async fn test_model_endpoint(
     let models_path = if anthropic { "v1/models" } else { "models" };
     let mut request = client.get(provider_url(&base_url, models_path));
     if anthropic {
-        if !api_key.trim().is_empty()
-            && !has_custom_header(&headers_json, "x-api-key")
-        {
+        if !api_key.trim().is_empty() && !has_custom_header(&headers_json, "x-api-key") {
             request = request.header("x-api-key", api_key.trim());
         }
         if !has_custom_header(&headers_json, "anthropic-version") {
@@ -104,6 +98,107 @@ async fn test_model_endpoint(
         let body = response.text().await.unwrap_or_default();
         let short_body: String = body.chars().take(160).collect();
         Err(format!("服务返回 HTTP {}：{}", status.as_u16(), short_body))
+    }
+}
+
+#[tauri::command]
+async fn list_provider_models(
+    provider: String,
+    model_kind: String,
+    base_url: String,
+    api_key: String,
+    headers_json: String,
+) -> Result<Vec<String>, String> {
+    if base_url.trim().is_empty() {
+        return Err("请先选择供应商或填写 Base URL".into());
+    }
+
+    let client = http_client()?;
+    let anthropic = uses_anthropic_messages(&provider);
+    let models_path = if anthropic {
+        "v1/models?limit=1000"
+    } else {
+        "models"
+    };
+    let mut request = client.get(provider_url(&base_url, models_path));
+
+    if anthropic {
+        if !api_key.trim().is_empty() && !has_custom_header(&headers_json, "x-api-key") {
+            request = request.header("x-api-key", api_key.trim());
+        }
+        if !has_custom_header(&headers_json, "anthropic-version") {
+            request = request.header("anthropic-version", "2023-06-01");
+        }
+    } else if !api_key.trim().is_empty() {
+        request = request.bearer_auth(api_key.trim());
+    }
+    request = apply_custom_headers(request, &headers_json)?;
+
+    let response = request
+        .send()
+        .await
+        .map_err(|error| format!("拉取模型失败：{error}"))?;
+    let status = response.status();
+    let payload: Value = response
+        .json()
+        .await
+        .map_err(|error| format!("无法解析模型列表：{error}"))?;
+
+    if !status.is_success() {
+        let message = payload
+            .pointer("/error/message")
+            .and_then(Value::as_str)
+            .or_else(|| payload.pointer("/message").and_then(Value::as_str))
+            .unwrap_or("供应商未返回模型列表");
+        return Err(format!("HTTP {}：{}", status.as_u16(), message));
+    }
+
+    let source = payload
+        .get("data")
+        .and_then(Value::as_array)
+        .or_else(|| payload.get("models").and_then(Value::as_array))
+        .ok_or_else(|| "供应商响应中没有模型列表，可继续手动填写模型 ID".to_string())?;
+
+    let mut models: Vec<String> = source
+        .iter()
+        .filter_map(|item| {
+            item.as_str().map(str::to_owned).or_else(|| {
+                ["id", "model", "name", "model_id"]
+                    .iter()
+                    .find_map(|key| item.get(key).and_then(Value::as_str).map(str::to_owned))
+            })
+        })
+        .filter(|model| !model.trim().is_empty())
+        .collect();
+
+    models.sort_by_key(|model| model.to_ascii_lowercase());
+    models.dedup();
+
+    let kind = model_kind.to_ascii_lowercase();
+    if kind == "image" || kind == "video" {
+        let filtered: Vec<String> = models
+            .iter()
+            .filter(|model| {
+                let normalized = model.to_ascii_lowercase();
+                if kind == "image" {
+                    normalized.contains("seedream")
+                        || normalized.contains("seededit")
+                        || normalized.contains("image")
+                } else {
+                    normalized.contains("seedance") || normalized.contains("video")
+                }
+            })
+            .cloned()
+            .collect();
+        if !filtered.is_empty() {
+            models = filtered;
+        }
+    }
+
+    if models.is_empty() {
+        Err("供应商没有返回可选模型，可继续手动填写模型 ID".into())
+    } else {
+        Ok(models)
     }
 }
 
@@ -132,8 +227,7 @@ async fn send_chat_message(
         api_path.trim()
     };
     let anthropic = uses_anthropic_messages(&provider);
-    let system_prompt =
-        "你是漫剧制作 Agent。请用简洁、专业的中文回复，并明确下一步可执行动作。";
+    let system_prompt = "你是漫剧制作 Agent。请用简洁、专业的中文回复，并明确下一步可执行动作。";
     let mut request = if anthropic {
         client.post(provider_url(&base_url, path)).json(&json!({
             "model": model,
@@ -165,9 +259,7 @@ async fn send_chat_message(
     };
 
     if anthropic {
-        if !api_key.trim().is_empty()
-            && !has_custom_header(&headers_json, "x-api-key")
-        {
+        if !api_key.trim().is_empty() && !has_custom_header(&headers_json, "x-api-key") {
             request = request.header("x-api-key", api_key.trim());
         }
         if !has_custom_header(&headers_json, "anthropic-version") {
@@ -252,6 +344,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             test_model_endpoint,
+            list_provider_models,
             send_chat_message,
             save_project_source
         ])
