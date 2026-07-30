@@ -153,6 +153,7 @@ type ModelProviderPreset = {
   headers: string;
   description: string;
   modelPlaceholder: string;
+  defaultModel?: string;
 };
 
 type ModelCatalogState = {
@@ -279,6 +280,16 @@ const modelProviderPresets: Record<
   ],
   image: [
     {
+      label: "Kie.ai Seedream",
+      baseUrl: "https://api.kie.ai",
+      apiPath: "api/v1/jobs/createTask",
+      headers: "{}",
+      description:
+        "当前调试服务 · Kie.ai 中转的 Seedream 5.0 Pro 异步生图 API",
+      modelPlaceholder: "seedream/5-pro-text-to-image",
+      defaultModel: "seedream/5-pro-text-to-image",
+    },
+    {
       label: "字节火山方舟 Seedream",
       baseUrl: "https://ark.cn-beijing.volces.com/api/v3",
       apiPath: "images/generations",
@@ -312,11 +323,11 @@ const defaultModelConfigs: ModelConfigs = {
   },
   image: {
     label: "生图模型",
-    provider: "字节火山方舟 Seedream",
-    baseUrl: "https://ark.cn-beijing.volces.com/api/v3",
-    model: "",
+    provider: "Kie.ai Seedream",
+    baseUrl: "https://api.kie.ai",
+    model: "seedream/5-pro-text-to-image",
     apiKey: "",
-    apiPath: "images/generations",
+    apiPath: "api/v1/jobs/createTask",
     headers: "{}",
   },
   video: {
@@ -359,7 +370,12 @@ function createMessage(
 }
 
 function isModelConfigured(config: ModelConfig) {
-  return Boolean(config.baseUrl.trim() && config.model.trim());
+  const apiKeyReady =
+    config.provider.includes("自定义") ||
+    Boolean(config.apiKey.trim());
+  return Boolean(
+    config.baseUrl.trim() && config.model.trim() && apiKeyReady,
+  );
 }
 
 function requiredGenerationModels(input: string): ModelKind[] {
@@ -627,39 +643,31 @@ function App() {
         current.chat.provider === "OpenAI 兼容"
           ? "自定义 OpenAI 兼容"
           : current.chat.provider;
-      const imagePreset = modelProviderPresets.image[0];
-      const imageNeedsMigration =
-        current.image.provider !== imagePreset.label;
-      const videoPreset = modelProviderPresets.video[0];
-      const videoNeedsMigration =
-        current.video.provider !== videoPreset.label;
       const chat = withoutLegacyEnabled(current.chat);
       const image = withoutLegacyEnabled(current.image);
       const video = withoutLegacyEnabled(current.video);
+      const kieImagePreset = modelProviderPresets.image[0];
+      const shouldUseKieDebugDefault =
+        image.provider === "字节火山方舟 Seedream" &&
+        !image.apiKey.trim() &&
+        !image.model.trim();
 
       return {
         chat: {
           ...chat,
           provider: normalizedChatProvider,
         },
-        image: imageNeedsMigration
+        image: shouldUseKieDebugDefault
           ? {
               ...image,
-              provider: imagePreset.label,
-              baseUrl: imagePreset.baseUrl,
-              apiPath: imagePreset.apiPath,
-              headers: imagePreset.headers,
+              provider: kieImagePreset.label,
+              baseUrl: kieImagePreset.baseUrl,
+              model: kieImagePreset.defaultModel ?? "",
+              apiPath: kieImagePreset.apiPath,
+              headers: kieImagePreset.headers,
             }
           : image,
-        video: videoNeedsMigration
-          ? {
-              ...video,
-              provider: videoPreset.label,
-              baseUrl: videoPreset.baseUrl,
-              apiPath: videoPreset.apiPath,
-              headers: videoPreset.headers,
-            }
-          : video,
+        video,
       };
     });
   }, [setModelConfigs]);
@@ -3086,6 +3094,9 @@ function SettingsDialog({
     onChange(activeKind, "baseUrl", preset.baseUrl);
     onChange(activeKind, "apiPath", preset.apiPath);
     onChange(activeKind, "headers", preset.headers);
+    if (provider !== config.provider) {
+      onChange(activeKind, "model", preset.defaultModel ?? "");
+    }
     if (provider.includes("自定义")) setAdvancedOpen(true);
   };
   const requestClose = () => {

@@ -8,6 +8,8 @@ use tauri::ipc::Channel;
 use tauri::Manager;
 use tokio::sync::watch;
 
+const KIE_SEEDREAM_MODELS: [&str; 1] = ["seedream/5-pro-text-to-image"];
+
 #[derive(Default)]
 struct ChatCancellationState {
     requests: Mutex<HashMap<String, watch::Sender<bool>>>,
@@ -39,6 +41,10 @@ fn provider_url(base_url: &str, path: &str) -> String {
 fn uses_anthropic_messages(provider: &str) -> bool {
     provider.to_ascii_lowercase().contains("anthropic")
         || provider.to_ascii_lowercase().contains("claude")
+}
+
+fn uses_kie_market(provider: &str) -> bool {
+    provider.to_ascii_lowercase().contains("kie.ai")
 }
 
 fn has_custom_header(headers_json: &str, expected: &str) -> bool {
@@ -134,6 +140,46 @@ fn apply_custom_headers(
     Ok(request)
 }
 
+async fn kie_credit_balance(
+    client: &reqwest::Client,
+    base_url: &str,
+    api_key: &str,
+    headers_json: &str,
+) -> Result<String, String> {
+    if api_key.trim().is_empty() {
+        return Err("请先填写 Kie.ai API Key".into());
+    }
+
+    let request = client
+        .get(provider_url(base_url, "api/v1/chat/credit"))
+        .bearer_auth(api_key.trim());
+    let request = apply_custom_headers(request, headers_json)?;
+    let response = request
+        .send()
+        .await
+        .map_err(|error| format!("连接 Kie.ai 失败：{error}"))?;
+    let status = response.status();
+    let payload: Value = response
+        .json()
+        .await
+        .map_err(|error| format!("无法解析 Kie.ai 响应：{error}"))?;
+    let code = payload.get("code").and_then(Value::as_i64);
+
+    if !status.is_success() || code != Some(200) {
+        let message = payload
+            .get("msg")
+            .and_then(Value::as_str)
+            .or_else(|| payload.pointer("/error/message").and_then(Value::as_str))
+            .unwrap_or("Kie.ai API Key 验证失败");
+        return Err(format!("HTTP {}：{}", status.as_u16(), message));
+    }
+
+    Ok(payload
+        .get("data")
+        .map(Value::to_string)
+        .unwrap_or_else(|| "未知".into()))
+}
+
 #[tauri::command]
 async fn test_model_endpoint(
     provider: String,
@@ -146,6 +192,11 @@ async fn test_model_endpoint(
     }
 
     let client = http_client()?;
+    if uses_kie_market(&provider) {
+        let credits = kie_credit_balance(&client, &base_url, &api_key, &headers_json).await?;
+        return Ok(format!("连接成功 · Kie.ai 剩余 {credits} 积分"));
+    }
+
     let anthropic = uses_anthropic_messages(&provider);
     let models_path = if anthropic { "v1/models" } else { "models" };
     let mut request = client.get(provider_url(&base_url, models_path));
@@ -189,6 +240,14 @@ async fn list_provider_models(
     }
 
     let client = http_client()?;
+    if uses_kie_market(&provider) {
+        kie_credit_balance(&client, &base_url, &api_key, &headers_json).await?;
+        return Ok(KIE_SEEDREAM_MODELS
+            .iter()
+            .map(|model| (*model).to_owned())
+            .collect());
+    }
+
     let anthropic = uses_anthropic_messages(&provider);
     let models_path = if anthropic {
         "v1/models?limit=1000"
@@ -539,7 +598,7 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::{complete_response_text, parse_sse_line};
+    use super::{complete_response_text, parse_sse_line, uses_kie_market, KIE_SEEDREAM_MODELS};
     use serde_json::json;
 
     #[test]
@@ -576,5 +635,12 @@ mod tests {
 
         assert_eq!(complete_response_text(&openai, false), Some("完整回复"));
         assert_eq!(complete_response_text(&anthropic, true), Some("完整回复"));
+    }
+
+    #[test]
+    fn recognizes_kie_seedream_provider_and_model() {
+        assert!(uses_kie_market("Kie.ai Seedream"));
+        assert!(!uses_kie_market("字节火山方舟 Seedream"));
+        assert_eq!(KIE_SEEDREAM_MODELS, ["seedream/5-pro-text-to-image"]);
     }
 }
