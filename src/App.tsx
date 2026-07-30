@@ -853,6 +853,7 @@ function App() {
           <ChatView
             project={selectedProject}
             thread={selectedThread}
+            modelName={modelConfigs.chat.model || "选择模型"}
             composer={composer}
             isResponding={isResponding}
             rightOpen={rightOpen}
@@ -1084,6 +1085,7 @@ function LeftSidebar({
 function ChatView({
   project,
   thread,
+  modelName,
   composer,
   isResponding,
   rightOpen,
@@ -1097,6 +1099,7 @@ function ChatView({
 }: {
   project: Project | null;
   thread: Thread | null;
+  modelName: string;
   composer: string;
   isResponding: boolean;
   rightOpen: boolean;
@@ -1173,72 +1176,84 @@ function ChatView({
       </div>
 
       <footer className="composer-area">
-        <SpotlightSurface className="composer">
-          <div className="composer-project-row">
-            <button
-              className={`project-picker ${project ? "selected" : ""}`}
-              onClick={onChooseFolder}
-            >
-              {project ? (
-                <FolderOpen size={15} />
-              ) : (
-                <Folder size={15} />
-              )}
-              <span>
-                {project ? project.name : "选择项目文件夹"}
-              </span>
-              <ChevronDown size={14} />
-            </button>
-          </div>
-          <textarea
-            ref={composerRef}
-            value={composer}
-            rows={2}
-            onChange={(event) => onComposerChange(event.target.value)}
-            onKeyDown={(event) => {
-              if (event.key === "Enter" && !event.shiftKey) {
-                event.preventDefault();
-                onSend();
-              }
-            }}
-            placeholder="向 Agent 描述这轮任务要完成什么…"
-          />
-          <div className="composer-toolbar">
-            <div>
-              <button className="round-button" onClick={onImport}>
-                <Plus size={17} />
-              </button>
-              <button className="composer-action" onClick={onImport}>
-                <Folder size={14} />
-                引用项目文件
-              </button>
+        <div className="composer-stack">
+          <button
+            className={`project-context-bar ${
+              project ? "selected" : ""
+            }`}
+            onClick={onChooseFolder}
+          >
+            {project ? (
+              <FolderOpen size={15} />
+            ) : (
+              <Folder size={15} />
+            )}
+            <span>
+              {project ? project.name : "选择项目文件夹"}
+            </span>
+          </button>
+
+          <SpotlightSurface className="composer">
+            <textarea
+              ref={composerRef}
+              value={composer}
+              rows={2}
+              onChange={(event) => onComposerChange(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" && !event.shiftKey) {
+                  event.preventDefault();
+                  onSend();
+                }
+              }}
+              placeholder="随心输入"
+            />
+            <div className="composer-toolbar">
+              <div>
+                <button
+                  className="round-button composer-add-button"
+                  onClick={onImport}
+                  aria-label="添加文件"
+                >
+                  <Plus size={18} />
+                </button>
+                <button
+                  className={`access-status ${
+                    project ? "granted" : ""
+                  }`}
+                  onClick={onChooseFolder}
+                >
+                  <AlertCircle size={15} />
+                  {project ? "项目访问" : "未选择文件夹"}
+                </button>
+              </div>
+              <div>
+                <button
+                  className="model-picker"
+                  onClick={onOpenSettings}
+                  title="配置对话模型"
+                >
+                  <span>{modelName}</span>
+                  <ChevronDown size={14} />
+                </button>
+                <button className="round-button" aria-label="语音输入">
+                  <Mic size={17} />
+                </button>
+                <button
+                  className={`send-button ${
+                    composer.trim() ? "ready" : ""
+                  }`}
+                  onClick={onSend}
+                  aria-label="发送"
+                >
+                  {composer.trim() ? (
+                    <ArrowUp size={18} />
+                  ) : (
+                    <AudioLines size={18} />
+                  )}
+                </button>
+              </div>
             </div>
-            <div>
-              <button className="composer-action" onClick={onOpenSettings}>
-                <Settings size={14} />
-                模型设置
-              </button>
-              <button className="round-button">
-                <Mic size={16} />
-              </button>
-              <button
-                className={`send-button ${
-                  composer.trim() ? "ready" : ""
-                }`}
-                onClick={onSend}
-                aria-label="发送"
-              >
-                {composer.trim() ? (
-                  <ArrowUp size={17} />
-                ) : (
-                  <AudioLines size={17} />
-                )}
-              </button>
-            </div>
-          </div>
-        </SpotlightSurface>
-        <div className="composer-note">
-          Agent 生成结果需要在正式发布前审核。
+          </SpotlightSurface>
         </div>
       </footer>
     </section>
