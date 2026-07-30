@@ -11,6 +11,22 @@ fn provider_url(base_url: &str, path: &str) -> String {
     )
 }
 
+fn uses_anthropic_messages(provider: &str) -> bool {
+    provider.to_ascii_lowercase().contains("anthropic")
+        || provider.to_ascii_lowercase().contains("claude")
+}
+
+fn has_custom_header(headers_json: &str, expected: &str) -> bool {
+    serde_json::from_str::<Value>(headers_json.trim())
+        .ok()
+        .and_then(|value| value.as_object().cloned())
+        .is_some_and(|headers| {
+            headers
+                .keys()
+                .any(|key| key.eq_ignore_ascii_case(expected))
+        })
+}
+
 fn http_client() -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
@@ -49,6 +65,7 @@ fn apply_custom_headers(
 
 #[tauri::command]
 async fn test_model_endpoint(
+    provider: String,
     base_url: String,
     api_key: String,
     headers_json: String,
@@ -58,8 +75,19 @@ async fn test_model_endpoint(
     }
 
     let client = http_client()?;
-    let mut request = client.get(provider_url(&base_url, "models"));
-    if !api_key.trim().is_empty() {
+    let anthropic = uses_anthropic_messages(&provider);
+    let models_path = if anthropic { "v1/models" } else { "models" };
+    let mut request = client.get(provider_url(&base_url, models_path));
+    if anthropic {
+        if !api_key.trim().is_empty()
+            && !has_custom_header(&headers_json, "x-api-key")
+        {
+            request = request.header("x-api-key", api_key.trim());
+        }
+        if !has_custom_header(&headers_json, "anthropic-version") {
+            request = request.header("anthropic-version", "2023-06-01");
+        }
+    } else if !api_key.trim().is_empty() {
         request = request.bearer_auth(api_key.trim());
     }
     request = apply_custom_headers(request, &headers_json)?;
@@ -81,6 +109,7 @@ async fn test_model_endpoint(
 
 #[tauri::command]
 async fn send_chat_message(
+    provider: String,
     base_url: String,
     api_key: String,
     model: String,
@@ -94,26 +123,57 @@ async fn send_chat_message(
 
     let client = http_client()?;
     let path = if api_path.trim().is_empty() {
-        "chat/completions"
+        if uses_anthropic_messages(&provider) {
+            "v1/messages"
+        } else {
+            "chat/completions"
+        }
     } else {
         api_path.trim()
     };
-    let mut request = client.post(provider_url(&base_url, path)).json(&json!({
-        "model": model,
-        "messages": [
-            {
-                "role": "system",
-                "content": "你是漫剧制作 Agent。请用简洁、专业的中文回复，并明确下一步可执行动作。"
-            },
-            {
-                "role": "user",
-                "content": input
-            }
-        ],
-        "stream": false
-    }));
+    let anthropic = uses_anthropic_messages(&provider);
+    let system_prompt =
+        "你是漫剧制作 Agent。请用简洁、专业的中文回复，并明确下一步可执行动作。";
+    let mut request = if anthropic {
+        client.post(provider_url(&base_url, path)).json(&json!({
+            "model": model,
+            "max_tokens": 4096,
+            "system": system_prompt,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": input
+                }
+            ],
+            "stream": false
+        }))
+    } else {
+        client.post(provider_url(&base_url, path)).json(&json!({
+            "model": model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": system_prompt
+                },
+                {
+                    "role": "user",
+                    "content": input
+                }
+            ],
+            "stream": false
+        }))
+    };
 
-    if !api_key.trim().is_empty() {
+    if anthropic {
+        if !api_key.trim().is_empty()
+            && !has_custom_header(&headers_json, "x-api-key")
+        {
+            request = request.header("x-api-key", api_key.trim());
+        }
+        if !has_custom_header(&headers_json, "anthropic-version") {
+            request = request.header("anthropic-version", "2023-06-01");
+        }
+    } else if !api_key.trim().is_empty() {
         request = request.bearer_auth(api_key.trim());
     }
     request = apply_custom_headers(request, &headers_json)?;
@@ -136,11 +196,19 @@ async fn send_chat_message(
         return Err(format!("HTTP {}：{}", status.as_u16(), message));
     }
 
-    payload
-        .pointer("/choices/0/message/content")
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-        .ok_or_else(|| "模型响应中没有可用文本".into())
+    if anthropic {
+        payload
+            .pointer("/content/0/text")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| "Anthropic 响应中没有可用文本".into())
+    } else {
+        payload
+            .pointer("/choices/0/message/content")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| "模型响应中没有可用文本".into())
+    }
 }
 
 #[tauri::command]

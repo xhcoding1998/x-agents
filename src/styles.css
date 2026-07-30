@@ -1430,6 +1430,14 @@ button:focus-visible {
   font-weight: 590;
 }
 
+.field > .field-hint {
+  min-height: 30px;
+  margin-top: 6px;
+  color: #858f98;
+  font-size: 11px;
+  line-height: 1.4;
+}
+
 .field > input,
 .field > select,
 .field > textarea,

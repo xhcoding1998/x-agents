@@ -117,6 +117,15 @@ type ModelConfig = {
 
 type ModelConfigs = Record<ModelKind, ModelConfig>;
 
+type ModelProviderPreset = {
+  label: string;
+  baseUrl: string;
+  apiPath: string;
+  headers: string;
+  description: string;
+  modelPlaceholder: string;
+};
+
 type WorkspaceSearchItem = {
   id: string;
   kind: "project" | "thread" | "resource";
@@ -146,11 +155,114 @@ const defaultSidebarPreferences: SidebarPreferences = {
   collapsedProjectIds: [],
 };
 
+const modelProviderPresets: Record<
+  ModelKind,
+  ModelProviderPreset[]
+> = {
+  chat: [
+    {
+      label: "OpenAI",
+      baseUrl: "https://api.openai.com/v1",
+      apiPath: "chat/completions",
+      headers: "{}",
+      description: "OpenAI 官方 API · Chat Completions 协议",
+      modelPlaceholder: "例如：gpt-5",
+    },
+    {
+      label: "Google Gemini",
+      baseUrl:
+        "https://generativelanguage.googleapis.com/v1beta/openai",
+      apiPath: "chat/completions",
+      headers: '{"x-goog-api-client":"manju-agent/0.1.0"}',
+      description: "Gemini 官方 OpenAI 兼容端点",
+      modelPlaceholder: "例如：gemini-3.6-flash",
+    },
+    {
+      label: "Anthropic Claude / Claude Code",
+      baseUrl: "https://api.anthropic.com",
+      apiPath: "v1/messages",
+      headers: "{}",
+      description: "Anthropic Messages 原生协议，可配置兼容网关",
+      modelPlaceholder: "例如：claude-opus-4-6",
+    },
+    {
+      label: "智谱 GLM",
+      baseUrl: "https://open.bigmodel.cn/api/paas/v4",
+      apiPath: "chat/completions",
+      headers: "{}",
+      description: "智谱开放平台 · OpenAI 兼容协议",
+      modelPlaceholder: "例如：glm-4.7",
+    },
+    {
+      label: "Moonshot Kimi",
+      baseUrl: "https://api.moonshot.cn/v1",
+      apiPath: "chat/completions",
+      headers: "{}",
+      description: "Moonshot 开放平台 · OpenAI 兼容协议",
+      modelPlaceholder: "填写控制台提供的 Kimi 模型 ID",
+    },
+    {
+      label: "DeepSeek",
+      baseUrl: "https://api.deepseek.com",
+      apiPath: "chat/completions",
+      headers: "{}",
+      description: "DeepSeek 官方 API · OpenAI 兼容协议",
+      modelPlaceholder: "例如：deepseek-v4-pro",
+    },
+    {
+      label: "阿里云通义千问",
+      baseUrl:
+        "https://dashscope.aliyuncs.com/compatible-mode/v1",
+      apiPath: "chat/completions",
+      headers: "{}",
+      description: "阿里云百炼北京地域 · OpenAI 兼容协议",
+      modelPlaceholder: "例如：qwen-plus",
+    },
+    {
+      label: "字节火山方舟（豆包）",
+      baseUrl: "https://ark.cn-beijing.volces.com/api/v3",
+      apiPath: "chat/completions",
+      headers: "{}",
+      description: "火山方舟官方端点 · OpenAI 兼容协议",
+      modelPlaceholder: "填写方舟模型 ID 或 Endpoint ID",
+    },
+    {
+      label: "自定义 OpenAI 兼容",
+      baseUrl: "",
+      apiPath: "chat/completions",
+      headers: "{}",
+      description: "适用于代理、网关和私有部署服务",
+      modelPlaceholder: "填写服务端使用的模型 ID",
+    },
+  ],
+  image: [
+    {
+      label: "字节火山方舟 Seedream",
+      baseUrl: "https://ark.cn-beijing.volces.com/api/v3",
+      apiPath: "images/generations",
+      headers: "{}",
+      description: "支持 Seedream 5.0 Lite、4.5、4.0 等字节生图模型",
+      modelPlaceholder:
+        "例如：doubao-seedream-4-0-250828 或 Endpoint ID",
+    },
+  ],
+  video: [
+    {
+      label: "自定义 REST",
+      baseUrl: "",
+      apiPath: "",
+      headers: "{}",
+      description: "视频模型将在接入具体服务后补充协议适配",
+      modelPlaceholder: "填写视频模型或 Endpoint ID",
+    },
+  ],
+};
+
 const defaultModelConfigs: ModelConfigs = {
   chat: {
     label: "对话模型",
-    provider: "OpenAI 兼容",
-    baseUrl: "",
+    provider: "OpenAI",
+    baseUrl: "https://api.openai.com/v1",
     model: "",
     apiKey: "",
     apiPath: "chat/completions",
@@ -159,8 +271,8 @@ const defaultModelConfigs: ModelConfigs = {
   },
   image: {
     label: "生图模型",
-    provider: "OpenAI 兼容",
-    baseUrl: "",
+    provider: "字节火山方舟 Seedream",
+    baseUrl: "https://ark.cn-beijing.volces.com/api/v3",
     model: "",
     apiKey: "",
     apiPath: "images/generations",
@@ -385,6 +497,41 @@ function App() {
     "manju-agent-model-configs-v2",
     defaultModelConfigs,
   );
+  useEffect(() => {
+    setModelConfigs((current) => {
+      const normalizedChatProvider =
+        current.chat.provider === "OpenAI 兼容"
+          ? "自定义 OpenAI 兼容"
+          : current.chat.provider;
+      const imagePreset = modelProviderPresets.image[0];
+      const imageNeedsMigration =
+        current.image.provider !== imagePreset.label;
+
+      if (
+        normalizedChatProvider === current.chat.provider &&
+        !imageNeedsMigration
+      ) {
+        return current;
+      }
+
+      return {
+        ...current,
+        chat: {
+          ...current.chat,
+          provider: normalizedChatProvider,
+        },
+        image: imageNeedsMigration
+          ? {
+              ...current.image,
+              provider: imagePreset.label,
+              baseUrl: imagePreset.baseUrl,
+              apiPath: imagePreset.apiPath,
+              headers: imagePreset.headers,
+            }
+          : current.image,
+      };
+    });
+  }, [setModelConfigs]);
   const [rightOpen, setRightOpen] = useStoredState(
     "manju-agent-right-panel-v2",
     true,
@@ -833,6 +980,7 @@ function App() {
     try {
       const { invoke } = await import("@tauri-apps/api/core");
       const reply = await invoke<string>("send_chat_message", {
+        provider: config.provider,
         baseUrl: config.baseUrl,
         apiKey: config.apiKey,
         model: config.model,
@@ -891,6 +1039,7 @@ function App() {
     try {
       const { invoke } = await import("@tauri-apps/api/core");
       const result = await invoke<string>("test_model_endpoint", {
+        provider: config.provider,
         baseUrl: config.baseUrl,
         apiKey: config.apiKey,
         headersJson: config.headers,
@@ -2044,6 +2193,36 @@ function SettingsDialog({
   const [section, setSection] = useState<"models" | "data">("models");
   const [closing, setClosing] = useState(false);
   const config = configs[activeKind];
+  const providerPresets = modelProviderPresets[activeKind];
+  const selectedProviderPreset =
+    providerPresets.find(
+      (preset) => preset.label === config.provider,
+    ) ?? {
+      label: config.provider,
+      baseUrl: config.baseUrl,
+      apiPath: config.apiPath,
+      headers: config.headers,
+      description: "保留已有的自定义服务配置",
+      modelPlaceholder: "填写服务端使用的模型 ID",
+    };
+  const providerOptions = [
+    ...providerPresets.map((preset) => preset.label),
+    ...(!providerPresets.some(
+      (preset) => preset.label === config.provider,
+    )
+      ? [config.provider]
+      : []),
+  ];
+  const changeProvider = (provider: string) => {
+    const preset = providerPresets.find(
+      (item) => item.label === provider,
+    );
+    onChange(activeKind, "provider", provider);
+    if (!preset) return;
+    onChange(activeKind, "baseUrl", preset.baseUrl);
+    onChange(activeKind, "apiPath", preset.apiPath);
+    onChange(activeKind, "headers", preset.headers);
+  };
   const requestClose = () => {
     if (closing) return;
     setClosing(true);
@@ -2155,19 +2334,16 @@ function SettingsDialog({
 
                   <div className="form-grid">
                     <div className="field">
-                      <span>接口协议</span>
+                      <span>服务厂商</span>
                       <CustomSelect
-                        label="接口协议"
+                        label="服务厂商"
                         value={config.provider}
-                        options={[
-                          "OpenAI 兼容",
-                          "自定义 REST",
-                          ...(activeKind === "image" ? ["ComfyUI"] : []),
-                        ]}
-                        onChange={(value) =>
-                          onChange(activeKind, "provider", value)
-                        }
+                        options={providerOptions}
+                        onChange={changeProvider}
                       />
+                      <small className="field-hint">
+                        {selectedProviderPreset.description}
+                      </small>
                     </div>
 
                     <label className="field">
@@ -2177,7 +2353,9 @@ function SettingsDialog({
                         onChange={(event) =>
                           onChange(activeKind, "model", event.target.value)
                         }
-                        placeholder="例如：gpt-5"
+                        placeholder={
+                          selectedProviderPreset.modelPlaceholder
+                        }
                         spellCheck={false}
                       />
                     </label>
