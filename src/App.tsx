@@ -604,10 +604,32 @@ function App() {
     kind?: "success" | "error";
     text?: string;
   }>({ loading: false });
-  const [modelCatalogs, setModelCatalogs] =
-    useState<Record<ModelKind, ModelCatalogState>>(
-      emptyModelCatalogs,
-    );
+  const [modelCatalogs, setModelCatalogs] = useStoredState<
+    Record<ModelKind, ModelCatalogState>
+  >("manju-agent-model-catalogs-v1", emptyModelCatalogs);
+  useEffect(() => {
+    setModelCatalogs((current) => {
+      const kinds: ModelKind[] = ["chat", "image", "video"];
+      if (
+        !kinds.some(
+          (kind) =>
+            current[kind].loading || Boolean(current[kind].error),
+        )
+      ) {
+        return current;
+      }
+      return Object.fromEntries(
+        kinds.map((kind) => [
+          kind,
+          {
+            ...current[kind],
+            loading: false,
+            error: "",
+          },
+        ]),
+      ) as Record<ModelKind, ModelCatalogState>;
+    });
+  }, [setModelCatalogs]);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const composerRef = useRef<HTMLTextAreaElement>(null);
 
@@ -1302,7 +1324,14 @@ function App() {
           <ChatView
             project={selectedProject}
             thread={selectedThread}
+            modelProvider={modelConfigs.chat.provider}
             modelName={modelConfigs.chat.model || "选择模型"}
+            modelOptions={
+              modelCatalogs.chat.provider ===
+              modelConfigs.chat.provider
+                ? modelCatalogs.chat.models
+                : []
+            }
             composer={composer}
             isResponding={isResponding}
             rightOpen={rightOpen}
@@ -1314,6 +1343,10 @@ function App() {
             onOpenSettings={() => {
               setActiveModelKind("chat");
               setSettingsDialogOpen(true);
+            }}
+            onSelectModel={(model) => {
+              updateModelConfig("chat", "model", model);
+              setToast(`已切换至 ${model}`);
             }}
             onToggleRight={() => setRightOpen((open) => !open)}
           />
@@ -1954,7 +1987,9 @@ function LeftSidebar({
 function ChatView({
   project,
   thread,
+  modelProvider,
   modelName,
+  modelOptions,
   composer,
   isResponding,
   rightOpen,
@@ -1964,11 +1999,14 @@ function ChatView({
   onChooseFolder,
   onImport,
   onOpenSettings,
+  onSelectModel,
   onToggleRight,
 }: {
   project: Project | null;
   thread: Thread | null;
+  modelProvider: string;
   modelName: string;
+  modelOptions: string[];
   composer: string;
   isResponding: boolean;
   rightOpen: boolean;
@@ -1978,6 +2016,7 @@ function ChatView({
   onChooseFolder: () => void;
   onImport: () => void;
   onOpenSettings: () => void;
+  onSelectModel: (model: string) => void;
   onToggleRight: () => void;
 }) {
   return (
@@ -2096,14 +2135,13 @@ function ChatView({
                 </button>
               </div>
               <div>
-                <button
-                  className="model-picker"
-                  onClick={onOpenSettings}
-                  title="配置对话模型"
-                >
-                  <span>{modelName}</span>
-                  <ChevronDown size={14} />
-                </button>
+                <ComposerModelPicker
+                  provider={modelProvider}
+                  value={modelName === "选择模型" ? "" : modelName}
+                  options={modelOptions}
+                  onChange={onSelectModel}
+                  onOpenSettings={onOpenSettings}
+                />
                 <button className="round-button" aria-label="语音输入">
                   <Mic size={17} />
                 </button>
@@ -2171,6 +2209,124 @@ function EmptyTask({
         </button>
       </div>
     </FadeContent>
+  );
+}
+
+function ComposerModelPicker({
+  provider,
+  value,
+  options,
+  onChange,
+  onOpenSettings,
+}: {
+  provider: string;
+  value: string;
+  options: string[];
+  onChange: (value: string) => void;
+  onOpenSettings: () => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const rootRef = useRef<HTMLDivElement>(null);
+  const menuId = useRef(`composer-model-${createId()}`).current;
+  const availableModels = useMemo(
+    () =>
+      [...new Set([value, ...options])]
+        .map((model) => model.trim())
+        .filter(Boolean),
+    [options, value],
+  );
+
+  useEffect(() => {
+    if (!open) return;
+    const handlePointerDown = (event: PointerEvent) => {
+      if (!rootRef.current?.contains(event.target as Node)) {
+        setOpen(false);
+      }
+    };
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setOpen(false);
+    };
+    document.addEventListener("pointerdown", handlePointerDown);
+    window.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.removeEventListener("pointerdown", handlePointerDown);
+      window.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [open]);
+
+  return (
+    <div
+      ref={rootRef}
+      className={`composer-model-picker ${open ? "open" : ""}`}
+    >
+      <button
+        type="button"
+        className="model-picker"
+        aria-label="切换对话模型"
+        aria-haspopup="menu"
+        aria-expanded={open}
+        aria-controls={menuId}
+        title="切换对话模型"
+        onClick={() => setOpen((current) => !current)}
+      >
+        <span>{value || "选择模型"}</span>
+        <ChevronDown size={14} />
+      </button>
+
+      <div
+        id={menuId}
+        className="composer-model-menu ui-popover"
+        role="menu"
+        aria-label="对话模型"
+        aria-hidden={!open}
+      >
+        <header>
+          <strong>切换模型</strong>
+          <span>{provider}</span>
+        </header>
+
+        {availableModels.length > 0 ? (
+          <div className="composer-model-options">
+            {availableModels.map((model) => (
+              <button
+                key={model}
+                type="button"
+                role="menuitemradio"
+                aria-checked={model === value}
+                className={model === value ? "active" : ""}
+                tabIndex={open ? 0 : -1}
+                onClick={() => {
+                  onChange(model);
+                  setOpen(false);
+                }}
+              >
+                <span>{model}</span>
+                {model === value && <Check size={16} />}
+              </button>
+            ))}
+          </div>
+        ) : (
+          <div className="composer-model-empty">
+            尚未配置可用的对话模型
+          </div>
+        )}
+
+        <button
+          type="button"
+          className="composer-model-settings"
+          role="menuitem"
+          tabIndex={open ? 0 : -1}
+          onClick={() => {
+            setOpen(false);
+            onOpenSettings();
+          }}
+        >
+          <Settings size={15} />
+          <span>模型设置</span>
+          <ChevronRight size={14} />
+        </button>
+      </div>
+    </div>
   );
 }
 
@@ -2736,7 +2892,13 @@ function SettingsDialog({
                       )}
                       {testState.loading ? "正在测试" : "测试连接"}
                     </button>
-                    <button className="primary-button" onClick={onSaved}>
+                    <button
+                      className="primary-button"
+                      onClick={() => {
+                        onSaved();
+                        requestClose();
+                      }}
+                    >
                       <Save size={15} />
                       保存配置
                     </button>
