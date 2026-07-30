@@ -67,6 +67,13 @@ type Message = {
   role: "user" | "assistant" | "system";
   content: string;
   createdAt: number;
+  actions?: MessageAction[];
+};
+
+type MessageAction = {
+  type: "configure-model";
+  modelKind: ModelKind;
+  label: string;
 };
 
 type Thread = {
@@ -112,7 +119,6 @@ type ModelConfig = {
   apiKey: string;
   apiPath: string;
   headers: string;
-  enabled: boolean;
 };
 
 type ModelConfigs = Record<ModelKind, ModelConfig>;
@@ -280,7 +286,6 @@ const defaultModelConfigs: ModelConfigs = {
     apiKey: "",
     apiPath: "chat/completions",
     headers: "{}",
-    enabled: false,
   },
   image: {
     label: "生图模型",
@@ -290,7 +295,6 @@ const defaultModelConfigs: ModelConfigs = {
     apiKey: "",
     apiPath: "images/generations",
     headers: "{}",
-    enabled: false,
   },
   video: {
     label: "视频模型",
@@ -300,7 +304,6 @@ const defaultModelConfigs: ModelConfigs = {
     apiKey: "",
     apiPath: "contents/generations/tasks",
     headers: "{}",
-    enabled: false,
   },
 };
 
@@ -321,8 +324,87 @@ function createId() {
 function createMessage(
   role: Message["role"],
   content: string,
+  actions?: MessageAction[],
 ): Message {
-  return { id: createId(), role, content, createdAt: Date.now() };
+  return {
+    id: createId(),
+    role,
+    content,
+    createdAt: Date.now(),
+    ...(actions && actions.length > 0 ? { actions } : {}),
+  };
+}
+
+function isModelConfigured(config: ModelConfig) {
+  return Boolean(config.baseUrl.trim() && config.model.trim());
+}
+
+function requiredGenerationModels(input: string): ModelKind[] {
+  const executionIntent =
+    /(生成|制作|创建|绘制|画一|画出|做成|做个|做一|做几|转成|变成|产出|输出|出图|开始做|帮我做)/i.test(
+      input,
+    );
+  if (!executionIntent) return [];
+
+  const needsVideo =
+    /(视频|漫剧|动态漫画|动画|成片|动态镜头|图生视频|文生视频|seedance)/i.test(
+      input,
+    );
+  const needsImage =
+    /(生图|图片|图像|一张图|几张图|张图|插画|漫画|立绘|角色图|场景图|分镜图|静态物料|seedream)/i.test(
+      input,
+    ) || /(漫剧|动态漫画)/i.test(input);
+
+  return [
+    ...(needsImage ? (["image"] as ModelKind[]) : []),
+    ...(needsVideo ? (["video"] as ModelKind[]) : []),
+  ];
+}
+
+function modelKindName(kind: ModelKind) {
+  if (kind === "image") return "生图模型";
+  if (kind === "video") return "视频模型";
+  return "对话模型";
+}
+
+function buildAgentSystemPrompt(
+  configs: ModelConfigs,
+  project: Project | null,
+) {
+  const capability = (kind: ModelKind) => {
+    const config = configs[kind];
+    return isModelConfigured(config)
+      ? `已配置（${config.provider} / ${config.model}）`
+      : "未配置";
+  };
+  const resourceSummary = project
+    ? resourceCategoryOrder
+        .map((category) => {
+          const count = project.resources.filter(
+            (resource) => resource.category === category,
+          ).length;
+          return count > 0 ? `${category} ${count}` : "";
+        })
+        .filter(Boolean)
+        .join("、") || "暂无制作资源"
+    : "当前任务未绑定项目文件夹";
+
+  return `你是漫剧制作 Agent，负责把小说逐步转化为可生产的漫剧。请用简洁、专业的中文回复，并给出下一步可执行动作。
+
+客户端实时能力状态：
+- 对话模型：${capability("chat")}
+- 生图模型：${capability("image")}
+- 视频模型：${capability("video")}
+- 当前项目：${project?.name ?? "未绑定"}
+- 已有资源：${resourceSummary}
+
+必须遵循的制作顺序：
+1. 导入原著后先建立章节索引、故事设定和角色表，不要一次把整本小说塞进上下文。
+2. 按章节或场次拆解剧情，形成剧本、镜头目标和连续性约束。
+3. 角色设定、场景设定和分镜确认后，才进入生图环节，生成角色、场景、分镜等静态物料。
+4. 静态物料和镜头运动方案准备完成后，才进入视频环节；视频模型用于文生视频、图生视频、动态镜头和成片素材。
+5. 缺少对应模型配置时，不得声称已经生成图片或视频；应明确指出缺少的能力并等待客户端引导用户配置。
+6. 不要跳过用户确认直接批量消耗生成额度。`;
 }
 
 function createThread(
@@ -512,6 +594,12 @@ function App() {
   );
   useEffect(() => {
     setModelConfigs((current) => {
+      const withoutLegacyEnabled = (
+        config: ModelConfig & { enabled?: boolean },
+      ): ModelConfig => {
+        const { enabled: _legacyEnabled, ...rest } = config;
+        return rest;
+      };
       const normalizedChatProvider =
         current.chat.provider === "OpenAI 兼容"
           ? "自定义 OpenAI 兼容"
@@ -522,39 +610,33 @@ function App() {
       const videoPreset = modelProviderPresets.video[0];
       const videoNeedsMigration =
         current.video.provider !== videoPreset.label;
-
-      if (
-        normalizedChatProvider === current.chat.provider &&
-        !imageNeedsMigration &&
-        !videoNeedsMigration
-      ) {
-        return current;
-      }
+      const chat = withoutLegacyEnabled(current.chat);
+      const image = withoutLegacyEnabled(current.image);
+      const video = withoutLegacyEnabled(current.video);
 
       return {
-        ...current,
         chat: {
-          ...current.chat,
+          ...chat,
           provider: normalizedChatProvider,
         },
         image: imageNeedsMigration
           ? {
-              ...current.image,
+              ...image,
               provider: imagePreset.label,
               baseUrl: imagePreset.baseUrl,
               apiPath: imagePreset.apiPath,
               headers: imagePreset.headers,
             }
-          : current.image,
+          : image,
         video: videoNeedsMigration
           ? {
-              ...current.video,
+              ...video,
               provider: videoPreset.label,
               baseUrl: videoPreset.baseUrl,
               apiPath: videoPreset.apiPath,
               headers: videoPreset.headers,
             }
-          : current.video,
+          : video,
       };
     });
   }, [setModelConfigs]);
@@ -986,48 +1068,72 @@ function App() {
     if (!input || isResponding) return;
 
     const config = modelConfigs.chat;
-    if (
-      !config.enabled ||
-      !config.baseUrl.trim() ||
-      !config.model.trim()
-    ) {
-      setActiveModelKind("chat");
-      setSettingsDialogOpen(true);
-      setToast("请先配置并启用对话模型");
-      return;
-    }
-
-    let thread = selectedThread;
-    if (!thread) {
-      thread = createThread();
-      setWorkspace((current) => ({
-        ...current,
-        threads: [thread as Thread, ...current.threads],
-      }));
-      setSelectedThreadId(thread.id);
-    }
-
+    const requiredKinds = [
+      ...(!isModelConfigured(config)
+        ? (["chat"] as ModelKind[])
+        : []),
+      ...requiredGenerationModels(input).filter(
+        (kind) => !isModelConfigured(modelConfigs[kind]),
+      ),
+    ].filter(
+      (kind, index, kinds) => kinds.indexOf(kind) === index,
+    );
+    const thread = selectedThread ?? createThread();
     const userMessage = createMessage("user", input);
+    const guideMessage =
+      requiredKinds.length > 0
+        ? createMessage(
+            "assistant",
+            `继续这个任务前，需要先配置${requiredKinds
+              .map(modelKindName)
+              .join("和")}。完成后回到当前对话重新发送即可，任务内容不会丢失。`,
+            requiredKinds.map((kind) => ({
+              type: "configure-model" as const,
+              modelKind: kind,
+              label: `配置${modelKindName(kind)}`,
+            })),
+          )
+        : null;
     const threadId = thread.id;
+    const messagesToAppend = [
+      userMessage,
+      ...(guideMessage ? [guideMessage] : []),
+    ];
     setComposer("");
-    setIsResponding(true);
-
     setWorkspace((current) => ({
       ...current,
-      threads: current.threads.map((item) =>
-        item.id === threadId
-          ? {
-              ...item,
-              title:
-                item.title === "新任务"
-                  ? input.slice(0, 24)
-                  : item.title,
+      threads: current.threads.some((item) => item.id === threadId)
+        ? current.threads.map((item) =>
+            item.id === threadId
+              ? {
+                  ...item,
+                  title:
+                    item.title === "新任务"
+                      ? input.slice(0, 24)
+                      : item.title,
+                  updatedAt: Date.now(),
+                  messages: [
+                    ...item.messages,
+                    ...messagesToAppend,
+                  ],
+                }
+              : item,
+          )
+        : [
+            {
+              ...thread,
+              title: input.slice(0, 24),
               updatedAt: Date.now(),
-              messages: [...item.messages, userMessage],
-            }
-          : item,
-      ),
+              messages: messagesToAppend,
+            },
+            ...current.threads,
+          ],
     }));
+    setSelectedThreadId(threadId);
+
+    if (guideMessage) return;
+
+    setIsResponding(true);
 
     try {
       const { invoke } = await import("@tauri-apps/api/core");
@@ -1039,6 +1145,10 @@ function App() {
         apiPath: config.apiPath,
         headersJson: config.headers,
         input,
+        systemPrompt: buildAgentSystemPrompt(
+          modelConfigs,
+          selectedProject,
+        ),
       });
       updateThread(threadId, (item) => ({
         ...item,
@@ -1347,6 +1457,10 @@ function App() {
             onSelectModel={(model) => {
               updateModelConfig("chat", "model", model);
               setToast(`已切换至 ${model}`);
+            }}
+            onConfigureModel={(kind) => {
+              setActiveModelKind(kind);
+              setSettingsDialogOpen(true);
             }}
             onToggleRight={() => setRightOpen((open) => !open)}
           />
@@ -2000,6 +2114,7 @@ function ChatView({
   onImport,
   onOpenSettings,
   onSelectModel,
+  onConfigureModel,
   onToggleRight,
 }: {
   project: Project | null;
@@ -2017,6 +2132,7 @@ function ChatView({
   onImport: () => void;
   onOpenSettings: () => void;
   onSelectModel: (model: string) => void;
+  onConfigureModel: (kind: ModelKind) => void;
   onToggleRight: () => void;
 }) {
   return (
@@ -2063,7 +2179,38 @@ function ChatView({
                     )}
                   </span>
                 )}
-                <div className="message-content">{message.content}</div>
+                {message.actions && message.actions.length > 0 ? (
+                  <div className="message-action-card">
+                    <div className="message-content">
+                      {message.content}
+                    </div>
+                    <div className="message-quick-actions">
+                      {message.actions.map((action) => (
+                        <button
+                          key={`${message.id}-${action.modelKind}`}
+                          type="button"
+                          onClick={() =>
+                            onConfigureModel(action.modelKind)
+                          }
+                        >
+                          {action.modelKind === "image" ? (
+                            <ImageIcon size={15} />
+                          ) : action.modelKind === "video" ? (
+                            <Video size={15} />
+                          ) : (
+                            <MessageSquareText size={15} />
+                          )}
+                          <span>{action.label}</span>
+                          <ChevronRight size={14} />
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                ) : (
+                  <div className="message-content">
+                    {message.content}
+                  </div>
+                )}
               </div>
             ))}
             {isResponding && (
@@ -2707,7 +2854,7 @@ function SettingsDialog({
                 <div className="settings-service-tabs" role="tablist">
                   <ModelTab
                     active={activeKind === "chat"}
-                    enabled={configs.chat.enabled}
+                    configured={isModelConfigured(configs.chat)}
                     icon={<MessageSquareText size={17} />}
                     label="对话模型"
                     description="分析与对话"
@@ -2715,7 +2862,7 @@ function SettingsDialog({
                   />
                   <ModelTab
                     active={activeKind === "image"}
-                    enabled={configs.image.enabled}
+                    configured={isModelConfigured(configs.image)}
                     icon={<ImageIcon size={17} />}
                     label="生图模型"
                     description="静态物料"
@@ -2723,7 +2870,7 @@ function SettingsDialog({
                   />
                   <ModelTab
                     active={activeKind === "video"}
-                    enabled={configs.video.enabled}
+                    configured={isModelConfigured(configs.video)}
                     icon={<Video size={17} />}
                     label="视频模型"
                     description="漫剧镜头"
@@ -2735,23 +2882,24 @@ function SettingsDialog({
                   <div className="model-form-heading">
                     <div>
                       <h3>{config.label}</h3>
-                      <p>连接兼容接口或你自己的服务。</p>
+                      <p>保存后立即作为当前服务使用。</p>
                     </div>
-                    <label className="toggle">
-                      <input
-                        type="checkbox"
-                        checked={config.enabled}
-                        onChange={(event) =>
-                          onChange(
-                            activeKind,
-                            "enabled",
-                            event.target.checked,
-                          )
-                        }
-                      />
-                      <span />
-                      启用
-                    </label>
+                    <span
+                      className={`model-config-badge ${
+                        isModelConfigured(config)
+                          ? "configured"
+                          : ""
+                      }`}
+                    >
+                      {isModelConfigured(config) ? (
+                        <CheckCircle2 size={14} />
+                      ) : (
+                        <AlertCircle size={14} />
+                      )}
+                      {isModelConfigured(config)
+                        ? "已配置"
+                        : "待配置"}
+                    </span>
                   </div>
 
                   <div className="form-grid">
@@ -2957,14 +3105,14 @@ function SettingsDialog({
 
 function ModelTab({
   active,
-  enabled,
+  configured,
   icon,
   label,
   description,
   onClick,
 }: {
   active: boolean;
-  enabled: boolean;
+  configured: boolean;
   icon: React.ReactNode;
   label: string;
   description: string;
@@ -2977,7 +3125,7 @@ function ModelTab({
         <strong>{label}</strong>
         <small>{description}</small>
       </span>
-      <i className={enabled ? "enabled" : ""} />
+      <i className={configured ? "configured" : ""} />
     </button>
   );
 }

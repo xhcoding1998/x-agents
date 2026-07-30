@@ -922,6 +922,48 @@ button:focus-visible {
   font-size: 11px;
 }
 
+.message-action-card {
+  max-width: min(88%, 560px);
+  padding-top: 3px;
+}
+
+.message-action-card .message-content {
+  max-width: none;
+  padding-top: 0;
+}
+
+.message-quick-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  margin-top: 10px;
+}
+
+.message-quick-actions button {
+  min-height: 34px;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 0 9px;
+  border: 1px solid #c9d8f3;
+  border-radius: 8px;
+  color: #315faa;
+  background: #f5f8ff;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.message-quick-actions button:hover,
+.message-quick-actions button:focus-visible {
+  border-color: #9fb9e8;
+  background: #eaf2ff;
+  transform: translateY(-1px);
+}
+
+.message-quick-actions button svg:last-child {
+  color: #8ba3ca;
+}
+
 .typing {
   display: flex;
   align-items: center;
@@ -1487,7 +1529,7 @@ button:focus-visible {
   background: #c8cdd1;
 }
 
-.model-tabs i.enabled {
+.model-tabs i.configured {
   background: var(--success);
 }
 
@@ -1565,6 +1607,26 @@ button:focus-visible {
 
 .toggle input:checked + span::after {
   transform: translateX(12px);
+}
+
+.model-config-badge {
+  min-height: 28px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 9px;
+  border: 1px solid #e1e5e8;
+  border-radius: 999px;
+  color: #858e96;
+  background: #f7f8f9;
+  font-size: 11.5px;
+  white-space: nowrap;
+}
+
+.model-config-badge.configured {
+  border-color: #bddfce;
+  color: #287b5f;
+  background: #eff9f4;
 }
 
 .form-grid {
@@ -2720,7 +2782,7 @@ button:focus-visible {
   background: #cbd1d6;
 }
 
-.settings-service-tabs i.enabled {
+.settings-service-tabs i.configured {
   background: var(--success);
   box-shadow: 0 0 0 3px rgb(39 153 112 / 10%);
 }

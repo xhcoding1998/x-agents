@@ -211,6 +211,7 @@ async fn send_chat_message(
     api_path: String,
     headers_json: String,
     input: String,
+    system_prompt: String,
 ) -> Result<String, String> {
     if base_url.trim().is_empty() || model.trim().is_empty() {
         return Err("请先配置对话模型的服务地址和模型 ID".into());
@@ -227,7 +228,11 @@ async fn send_chat_message(
         api_path.trim()
     };
     let anthropic = uses_anthropic_messages(&provider);
-    let system_prompt = "你是漫剧制作 Agent。请用简洁、专业的中文回复，并明确下一步可执行动作。";
+    let system_prompt = if system_prompt.trim().is_empty() {
+        "你是漫剧制作 Agent。请用简洁、专业的中文回复，并明确下一步可执行动作。"
+    } else {
+        system_prompt.trim()
+    };
     let mut request = if anthropic {
         client.post(provider_url(&base_url, path)).json(&json!({
             "model": model,
