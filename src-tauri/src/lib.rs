@@ -1,7 +1,32 @@
+use serde::Serialize;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Mutex;
 use std::time::Duration;
+use tauri::ipc::Channel;
 use tauri::Manager;
+use tokio::sync::watch;
+
+#[derive(Default)]
+struct ChatCancellationState {
+    requests: Mutex<HashMap<String, watch::Sender<bool>>>,
+}
+
+#[derive(Clone, Serialize)]
+struct ChatStreamEvent {
+    event: String,
+    data: String,
+}
+
+impl ChatStreamEvent {
+    fn new(event: &str, data: impl Into<String>) -> Self {
+        Self {
+            event: event.into(),
+            data: data.into(),
+        }
+    }
+}
 
 fn provider_url(base_url: &str, path: &str) -> String {
     format!(
@@ -25,9 +50,59 @@ fn has_custom_header(headers_json: &str, expected: &str) -> bool {
 
 fn http_client() -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
+        .connect_timeout(Duration::from_secs(20))
+        .timeout(Duration::from_secs(600))
         .build()
         .map_err(|error| format!("无法创建网络客户端：{error}"))
+}
+
+fn stream_delta(payload: &Value, anthropic: bool) -> Option<&str> {
+    if anthropic {
+        payload
+            .pointer("/delta/text")
+            .and_then(Value::as_str)
+            .or_else(|| {
+                payload
+                    .pointer("/content_block/text")
+                    .and_then(Value::as_str)
+            })
+    } else {
+        payload
+            .pointer("/choices/0/delta/content")
+            .and_then(Value::as_str)
+    }
+}
+
+fn complete_response_text(payload: &Value, anthropic: bool) -> Option<&str> {
+    if anthropic {
+        payload.pointer("/content/0/text").and_then(Value::as_str)
+    } else {
+        payload
+            .pointer("/choices/0/message/content")
+            .and_then(Value::as_str)
+    }
+}
+
+fn parse_sse_line(line: &[u8], anthropic: bool) -> Option<String> {
+    let line = String::from_utf8_lossy(line);
+    let data = line.trim().strip_prefix("data:").map(str::trim)?;
+    if data.is_empty() || data == "[DONE]" {
+        return None;
+    }
+    let payload = serde_json::from_str::<Value>(data).ok()?;
+    let delta = stream_delta(&payload, anthropic)?;
+    if delta.is_empty() {
+        return None;
+    }
+    Some(delta.to_owned())
+}
+
+fn emit_sse_line(line: &[u8], anthropic: bool, on_event: &Channel<ChatStreamEvent>) -> bool {
+    let Some(delta) = parse_sse_line(line, anthropic) else {
+        return false;
+    };
+    let _ = on_event.send(ChatStreamEvent::new("delta", delta));
+    true
 }
 
 fn apply_custom_headers(
@@ -203,7 +278,9 @@ async fn list_provider_models(
 }
 
 #[tauri::command]
-async fn send_chat_message(
+async fn stream_chat_message(
+    cancellation: tauri::State<'_, ChatCancellationState>,
+    request_id: String,
     provider: String,
     base_url: String,
     api_key: String,
@@ -212,9 +289,13 @@ async fn send_chat_message(
     headers_json: String,
     input: String,
     system_prompt: String,
-) -> Result<String, String> {
+    on_event: Channel<ChatStreamEvent>,
+) -> Result<(), String> {
     if base_url.trim().is_empty() || model.trim().is_empty() {
         return Err("请先配置对话模型的服务地址和模型 ID".into());
+    }
+    if request_id.trim().is_empty() {
+        return Err("请求 ID 无效".into());
     }
 
     let client = http_client()?;
@@ -244,7 +325,7 @@ async fn send_chat_message(
                     "content": input
                 }
             ],
-            "stream": false
+            "stream": true
         }))
     } else {
         client.post(provider_url(&base_url, path)).json(&json!({
@@ -259,7 +340,7 @@ async fn send_chat_message(
                     "content": input
                 }
             ],
-            "stream": false
+            "stream": true
         }))
     };
 
@@ -274,38 +355,135 @@ async fn send_chat_message(
         request = request.bearer_auth(api_key.trim());
     }
     request = apply_custom_headers(request, &headers_json)?;
+    let (cancel_tx, mut cancel_rx) = watch::channel(false);
+    cancellation
+        .requests
+        .lock()
+        .map_err(|_| "无法创建取消信号".to_string())?
+        .insert(request_id.clone(), cancel_tx);
 
-    let response = request
-        .send()
-        .await
-        .map_err(|error| format!("请求失败：{error}"))?;
+    let mut response = tokio::select! {
+        _ = cancel_rx.changed() => {
+            cancellation.requests.lock().ok().and_then(|mut requests| requests.remove(&request_id));
+            let _ = on_event.send(ChatStreamEvent::new("cancelled", ""));
+            return Ok(());
+        }
+        result = request.send() => {
+            match result {
+                Ok(response) => response,
+                Err(error) => {
+                    cancellation.requests.lock().ok().and_then(|mut requests| requests.remove(&request_id));
+                    return Err(format!("请求失败：{error}"));
+                }
+            }
+        }
+    };
     let status = response.status();
-    let payload: Value = response
-        .json()
-        .await
-        .map_err(|error| format!("无法解析模型响应：{error}"))?;
 
     if !status.is_success() {
-        let message = payload
-            .pointer("/error/message")
-            .and_then(Value::as_str)
-            .unwrap_or("模型服务返回错误");
+        let body = response.text().await.unwrap_or_default();
+        cancellation
+            .requests
+            .lock()
+            .ok()
+            .and_then(|mut requests| requests.remove(&request_id));
+        let message = serde_json::from_str::<Value>(&body)
+            .ok()
+            .and_then(|payload| {
+                payload
+                    .pointer("/error/message")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .unwrap_or_else(|| body.chars().take(200).collect());
         return Err(format!("HTTP {}：{}", status.as_u16(), message));
     }
 
-    if anthropic {
-        payload
-            .pointer("/content/0/text")
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-            .ok_or_else(|| "Anthropic 响应中没有可用文本".into())
-    } else {
-        payload
-            .pointer("/choices/0/message/content")
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-            .ok_or_else(|| "模型响应中没有可用文本".into())
+    let _ = on_event.send(ChatStreamEvent::new("started", ""));
+    let mut line_buffer: Vec<u8> = Vec::new();
+    let mut raw_body: Vec<u8> = Vec::new();
+    let mut emitted_delta = false;
+    let mut cancelled = false;
+
+    loop {
+        let next_chunk = tokio::select! {
+            _ = cancel_rx.changed() => {
+                if *cancel_rx.borrow() {
+                    cancelled = true;
+                    None
+                } else {
+                    continue;
+                }
+            }
+            result = response.chunk() => {
+                match result {
+                    Ok(chunk) => chunk,
+                    Err(error) => {
+                        cancellation.requests.lock().ok().and_then(|mut requests| requests.remove(&request_id));
+                        return Err(format!("读取流式响应失败：{error}"));
+                    }
+                }
+            }
+        };
+
+        let Some(chunk) = next_chunk else {
+            break;
+        };
+        raw_body.extend_from_slice(&chunk);
+        line_buffer.extend_from_slice(&chunk);
+
+        while let Some(newline) = line_buffer.iter().position(|byte| *byte == b'\n') {
+            let line: Vec<u8> = line_buffer.drain(..=newline).collect();
+            emitted_delta |= emit_sse_line(&line, anthropic, &on_event);
+        }
     }
+
+    if !cancelled && !line_buffer.is_empty() {
+        emitted_delta |= emit_sse_line(&line_buffer, anthropic, &on_event);
+    }
+
+    if !cancelled && !emitted_delta {
+        if let Ok(payload) = serde_json::from_slice::<Value>(&raw_body) {
+            if let Some(text) = complete_response_text(&payload, anthropic) {
+                if !text.is_empty() {
+                    let _ = on_event.send(ChatStreamEvent::new("delta", text));
+                    emitted_delta = true;
+                }
+            }
+        }
+    }
+
+    cancellation
+        .requests
+        .lock()
+        .ok()
+        .and_then(|mut requests| requests.remove(&request_id));
+
+    if cancelled {
+        let _ = on_event.send(ChatStreamEvent::new("cancelled", ""));
+        return Ok(());
+    }
+
+    if !emitted_delta {
+        return Err("模型响应中没有可用文本".into());
+    }
+
+    let _ = on_event.send(ChatStreamEvent::new("finished", ""));
+    Ok(())
+}
+
+#[tauri::command]
+fn cancel_chat_generation(
+    cancellation: tauri::State<'_, ChatCancellationState>,
+    request_id: String,
+) -> Result<bool, String> {
+    let requests = cancellation
+        .requests
+        .lock()
+        .map_err(|_| "无法读取生成状态".to_string())?;
+    Ok(requests
+        .get(&request_id)
+        .is_some_and(|sender| sender.send(true).is_ok()))
 }
 
 #[tauri::command]
@@ -346,13 +524,57 @@ async fn save_project_source(
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .manage(ChatCancellationState::default())
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             test_model_endpoint,
             list_provider_models,
-            send_chat_message,
+            stream_chat_message,
+            cancel_chat_generation,
             save_project_source
         ])
         .run(tauri::generate_context!())
         .expect("error while running Manju Agent");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{complete_response_text, parse_sse_line};
+    use serde_json::json;
+
+    #[test]
+    fn parses_openai_chat_completion_delta() {
+        let line = r#"data: {"choices":[{"delta":{"content":"你好"}}]}"#;
+
+        assert_eq!(
+            parse_sse_line(line.as_bytes(), false).as_deref(),
+            Some("你好")
+        );
+    }
+
+    #[test]
+    fn parses_anthropic_content_block_delta() {
+        let line =
+            r#"data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"世界"}}"#;
+
+        assert_eq!(
+            parse_sse_line(line.as_bytes(), true).as_deref(),
+            Some("世界")
+        );
+    }
+
+    #[test]
+    fn ignores_sse_control_lines() {
+        assert_eq!(parse_sse_line(b"event: message_start", true), None);
+        assert_eq!(parse_sse_line(b"data: [DONE]", false), None);
+    }
+
+    #[test]
+    fn reads_non_streaming_fallback_payloads() {
+        let openai = json!({"choices": [{"message": {"content": "完整回复"}}]});
+        let anthropic = json!({"content": [{"type": "text", "text": "完整回复"}]});
+
+        assert_eq!(complete_response_text(&openai, false), Some("完整回复"));
+        assert_eq!(complete_response_text(&anthropic, true), Some("完整回复"));
+    }
 }

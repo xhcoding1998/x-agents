@@ -1,4 +1,5 @@
 import {
+  ArrowDown,
   ArrowUp,
   AlertCircle,
   AudioLines,
@@ -39,6 +40,8 @@ import {
   Video,
   X,
 } from "lucide-react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import type {
   CSSProperties,
   MouseEvent as ReactMouseEvent,
@@ -68,12 +71,32 @@ type Message = {
   content: string;
   createdAt: number;
   actions?: MessageAction[];
+  status?: "stopped";
 };
 
 type MessageAction = {
   type: "configure-model";
   modelKind: ModelKind;
   label: string;
+};
+
+type StreamingMessage = {
+  id: string;
+  threadId: string;
+  content: string;
+};
+
+type ChatStreamEvent = {
+  event: "started" | "delta" | "finished" | "cancelled";
+  data: string;
+};
+
+type ActiveGeneration = {
+  requestId: string;
+  threadId: string;
+  messageId: string;
+  content: string;
+  cancelled: boolean;
 };
 
 type Thread = {
@@ -677,6 +700,8 @@ function App() {
     useState<ModelKind>("chat");
   const [composer, setComposer] = useState("");
   const [isResponding, setIsResponding] = useState(false);
+  const [streamingMessage, setStreamingMessage] =
+    useState<StreamingMessage | null>(null);
   const [searchDialogOpen, setSearchDialogOpen] = useState(false);
   const [settingsDialogOpen, setSettingsDialogOpen] = useState(false);
   const [resourcePreviewOpen, setResourcePreviewOpen] = useState(false);
@@ -714,6 +739,10 @@ function App() {
   }, [setModelCatalogs]);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const composerRef = useRef<HTMLTextAreaElement>(null);
+  const activeGenerationRef = useRef<ActiveGeneration | null>(
+    null,
+  );
+  const pendingGuidanceRef = useRef(false);
 
   const clampLeftWidth = (
     width: number,
@@ -1133,11 +1162,58 @@ function App() {
 
     if (guideMessage) return;
 
+    const requestId = createId();
+    const messageId = createId();
+    activeGenerationRef.current = {
+      requestId,
+      threadId,
+      messageId,
+      content: "",
+      cancelled: false,
+    };
+    setStreamingMessage({
+      id: messageId,
+      threadId,
+      content: "",
+    });
     setIsResponding(true);
 
     try {
-      const { invoke } = await import("@tauri-apps/api/core");
-      const reply = await invoke<string>("send_chat_message", {
+      const { Channel, invoke } = await import(
+        "@tauri-apps/api/core"
+      );
+      const onEvent = new Channel<ChatStreamEvent>();
+      let settleStream: () => void = () => undefined;
+      const streamSettled = new Promise<void>((resolve) => {
+        settleStream = resolve;
+      });
+      onEvent.onmessage = (event) => {
+        if (
+          event.event === "finished" ||
+          event.event === "cancelled"
+        ) {
+          settleStream();
+        }
+        const active = activeGenerationRef.current;
+        if (
+          !active ||
+          active.requestId !== requestId ||
+          active.cancelled
+        ) {
+          return;
+        }
+        if (event.event === "delta" && event.data) {
+          active.content += event.data;
+          setStreamingMessage({
+            id: active.messageId,
+            threadId: active.threadId,
+            content: active.content,
+          });
+        }
+      };
+
+      await invoke<void>("stream_chat_message", {
+        requestId,
         provider: config.provider,
         baseUrl: config.baseUrl,
         apiKey: config.apiKey,
@@ -1149,16 +1225,31 @@ function App() {
           modelConfigs,
           selectedProject,
         ),
+        onEvent,
       });
-      updateThread(threadId, (item) => ({
-        ...item,
-        updatedAt: Date.now(),
-        messages: [
-          ...item.messages,
-          createMessage("assistant", reply),
-        ],
-      }));
+
+      await streamSettled;
+      const completed = activeGenerationRef.current;
+      if (!completed || completed.requestId !== requestId) return;
+      if (completed.content.trim()) {
+        updateThread(threadId, (item) => ({
+          ...item,
+          updatedAt: Date.now(),
+          messages: [
+            ...item.messages,
+            createMessage("assistant", completed.content),
+          ],
+        }));
+      }
+      activeGenerationRef.current = null;
+      setStreamingMessage(null);
+      setIsResponding(false);
     } catch (error) {
+      const failed = activeGenerationRef.current;
+      if (!failed || failed.requestId !== requestId) return;
+      activeGenerationRef.current = null;
+      setStreamingMessage(null);
+      setIsResponding(false);
       updateThread(threadId, (item) => ({
         ...item,
         messages: [
@@ -1169,9 +1260,67 @@ function App() {
           ),
         ],
       }));
-    } finally {
-      setIsResponding(false);
     }
+  };
+
+  const stopGeneration = () => {
+    const active = activeGenerationRef.current;
+    if (!active) {
+      setIsResponding(false);
+      setStreamingMessage(null);
+      return;
+    }
+
+    active.cancelled = true;
+    activeGenerationRef.current = null;
+    setStreamingMessage(null);
+    setIsResponding(false);
+
+    if (active.content.trim()) {
+      updateThread(active.threadId, (thread) => ({
+        ...thread,
+        updatedAt: Date.now(),
+        messages: [
+          ...thread.messages,
+          {
+            ...createMessage("assistant", active.content),
+            status: "stopped",
+          },
+        ],
+      }));
+    } else {
+      updateThread(active.threadId, (thread) => ({
+        ...thread,
+        updatedAt: Date.now(),
+        messages: [
+          ...thread.messages,
+          createMessage("system", "已停止生成"),
+        ],
+      }));
+    }
+
+    void import("@tauri-apps/api/core")
+      .then(({ invoke }) =>
+        invoke<boolean>("cancel_chat_generation", {
+          requestId: active.requestId,
+        }),
+      )
+      .catch(() => undefined);
+  };
+
+  useEffect(() => {
+    if (isResponding || !pendingGuidanceRef.current) return;
+    pendingGuidanceRef.current = false;
+    void sendMessage();
+  }, [isResponding]);
+
+  const interruptAndSendGuidance = () => {
+    if (!composer.trim()) {
+      stopGeneration();
+      return;
+    }
+    pendingGuidanceRef.current = true;
+    stopGeneration();
   };
 
   const updateModelConfig = <K extends keyof ModelConfig>(
@@ -1444,10 +1593,13 @@ function App() {
             }
             composer={composer}
             isResponding={isResponding}
+            streamingMessage={streamingMessage}
             rightOpen={rightOpen}
             composerRef={composerRef}
             onComposerChange={setComposer}
             onSend={() => void sendMessage()}
+            onStop={stopGeneration}
+            onInterruptAndSend={interruptAndSendGuidance}
             onChooseFolder={() => void chooseProjectFolder()}
             onImport={() => fileInputRef.current?.click()}
             onOpenSettings={() => {
@@ -2098,6 +2250,29 @@ function LeftSidebar({
   );
 }
 
+function MarkdownMessage({ content }: { content: string }) {
+  return (
+    <div className="markdown-body">
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        components={{
+          a: ({ children, ...props }) => (
+            <a
+              {...props}
+              target="_blank"
+              rel="noreferrer noopener"
+            >
+              {children}
+            </a>
+          ),
+        }}
+      >
+        {content}
+      </ReactMarkdown>
+    </div>
+  );
+}
+
 function ChatView({
   project,
   thread,
@@ -2106,10 +2281,13 @@ function ChatView({
   modelOptions,
   composer,
   isResponding,
+  streamingMessage,
   rightOpen,
   composerRef,
   onComposerChange,
   onSend,
+  onStop,
+  onInterruptAndSend,
   onChooseFolder,
   onImport,
   onOpenSettings,
@@ -2124,10 +2302,13 @@ function ChatView({
   modelOptions: string[];
   composer: string;
   isResponding: boolean;
+  streamingMessage: StreamingMessage | null;
   rightOpen: boolean;
   composerRef: React.RefObject<HTMLTextAreaElement | null>;
   onComposerChange: (value: string) => void;
   onSend: () => void;
+  onStop: () => void;
+  onInterruptAndSend: () => void;
   onChooseFolder: () => void;
   onImport: () => void;
   onOpenSettings: () => void;
@@ -2135,6 +2316,52 @@ function ChatView({
   onConfigureModel: (kind: ModelKind) => void;
   onToggleRight: () => void;
 }) {
+  const chatScrollRef = useRef<HTMLDivElement>(null);
+  const followOutputRef = useRef(true);
+  const previousThreadIdRef = useRef(thread?.id ?? "");
+  const previousRespondingRef = useRef(false);
+  const [followingOutput, setFollowingOutput] = useState(true);
+  const activeStreamingMessage =
+    streamingMessage?.threadId === thread?.id
+      ? streamingMessage
+      : null;
+
+  const scrollToBottom = (behavior: ScrollBehavior = "auto") => {
+    const container = chatScrollRef.current;
+    if (!container) return;
+    followOutputRef.current = true;
+    setFollowingOutput(true);
+    container.scrollTo({
+      top: container.scrollHeight,
+      behavior,
+    });
+  };
+
+  useEffect(() => {
+    const threadChanged =
+      previousThreadIdRef.current !== (thread?.id ?? "");
+    const generationStarted =
+      isResponding && !previousRespondingRef.current;
+    previousThreadIdRef.current = thread?.id ?? "";
+    previousRespondingRef.current = isResponding;
+
+    if (threadChanged || generationStarted) {
+      followOutputRef.current = true;
+      setFollowingOutput(true);
+    }
+    if (!followOutputRef.current) return;
+
+    const frame = window.requestAnimationFrame(() =>
+      scrollToBottom("auto"),
+    );
+    return () => window.cancelAnimationFrame(frame);
+  }, [
+    activeStreamingMessage?.content,
+    isResponding,
+    thread?.id,
+    thread?.messages.length,
+  ]);
+
   return (
     <section className="chat-view">
       <header className="center-header">
@@ -2155,8 +2382,22 @@ function ChatView({
         </button>
       </header>
 
-      <div className="chat-scroll">
-        {!thread || thread.messages.length === 0 ? (
+      <div
+        ref={chatScrollRef}
+        className="chat-scroll"
+        onScroll={(event) => {
+          const container = event.currentTarget;
+          const distance =
+            container.scrollHeight -
+            container.scrollTop -
+            container.clientHeight;
+          const nearBottom = distance < 72;
+          followOutputRef.current = nearBottom;
+          setFollowingOutput(nearBottom);
+        }}
+      >
+        {(!thread || thread.messages.length === 0) &&
+        !activeStreamingMessage ? (
           <EmptyTask
             project={project}
             onChooseFolder={onChooseFolder}
@@ -2165,7 +2406,7 @@ function ChatView({
           />
         ) : (
           <div className="message-column">
-            {thread.messages.map((message) => (
+            {thread?.messages.map((message) => (
               <div
                 key={message.id}
                 className={`message message-${message.role}`}
@@ -2179,56 +2420,97 @@ function ChatView({
                     )}
                   </span>
                 )}
-                {message.actions && message.actions.length > 0 ? (
-                  <div className="message-action-card">
-                    <div className="message-content">
-                      {message.content}
-                    </div>
-                    <div className="message-quick-actions">
-                      {message.actions.map((action) => (
-                        <button
-                          key={`${message.id}-${action.modelKind}`}
-                          type="button"
-                          onClick={() =>
-                            onConfigureModel(action.modelKind)
-                          }
-                        >
-                          {action.modelKind === "image" ? (
-                            <ImageIcon size={15} />
-                          ) : action.modelKind === "video" ? (
-                            <Video size={15} />
-                          ) : (
-                            <MessageSquareText size={15} />
-                          )}
-                          <span>{action.label}</span>
-                          <ChevronRight size={14} />
-                        </button>
-                      ))}
-                    </div>
-                  </div>
-                ) : (
+                {message.role === "user" ? (
                   <div className="message-content">
                     {message.content}
+                  </div>
+                ) : (
+                  <div
+                    className={`message-body ${
+                      message.actions &&
+                      message.actions.length > 0
+                        ? "message-action-card"
+                        : ""
+                    }`}
+                  >
+                    <div className="message-content">
+                      <MarkdownMessage content={message.content} />
+                    </div>
+                    {message.actions &&
+                      message.actions.length > 0 && (
+                        <div className="message-quick-actions">
+                          {message.actions.map((action) => (
+                            <button
+                              key={`${message.id}-${action.modelKind}`}
+                              type="button"
+                              onClick={() =>
+                                onConfigureModel(
+                                  action.modelKind,
+                                )
+                              }
+                            >
+                              {action.modelKind === "image" ? (
+                                <ImageIcon size={15} />
+                              ) : action.modelKind === "video" ? (
+                                <Video size={15} />
+                              ) : (
+                                <MessageSquareText size={15} />
+                              )}
+                              <span>{action.label}</span>
+                              <ChevronRight size={14} />
+                            </button>
+                          ))}
+                        </div>
+                      )}
+                    {message.status === "stopped" && (
+                      <div className="message-generation-status">
+                        已停止生成
+                      </div>
+                    )}
                   </div>
                 )}
               </div>
             ))}
-            {isResponding && (
-              <div className="message message-assistant">
+            {activeStreamingMessage && (
+              <div className="message message-assistant message-streaming">
                 <span className="message-avatar">
                   <Clapperboard size={14} />
                 </span>
-                <div className="typing">
-                  <ShinyStatus>Agent 正在生成</ShinyStatus>
-                  <span />
-                  <span />
-                  <span />
-                </div>
+                {activeStreamingMessage.content ? (
+                  <div className="message-body">
+                    <div className="message-content">
+                      <MarkdownMessage
+                        content={activeStreamingMessage.content}
+                      />
+                    </div>
+                  </div>
+                ) : (
+                  <div className="typing">
+                    <ShinyStatus>Agent 正在生成</ShinyStatus>
+                    <span />
+                    <span />
+                    <span />
+                  </div>
+                )}
               </div>
             )}
           </div>
         )}
       </div>
+
+      {!followingOutput &&
+        Boolean(
+          thread?.messages.length || activeStreamingMessage,
+        ) && (
+          <button
+            type="button"
+            className="chat-scroll-to-bottom"
+            aria-label="回到最新消息"
+            onClick={() => scrollToBottom("smooth")}
+          >
+            <ArrowDown size={16} />
+          </button>
+        )}
 
       <footer className="composer-area">
         <div className="composer-stack">
@@ -2257,10 +2539,18 @@ function ChatView({
               onKeyDown={(event) => {
                 if (event.key === "Enter" && !event.shiftKey) {
                   event.preventDefault();
-                  onSend();
+                  if (isResponding) {
+                    onInterruptAndSend();
+                  } else {
+                    onSend();
+                  }
                 }
               }}
-              placeholder="随心输入"
+              placeholder={
+                isResponding
+                  ? "输入新要求，按 Enter 中断并继续"
+                  : "随心输入"
+              }
             />
             <div className="composer-toolbar">
               <div>
@@ -2294,12 +2584,18 @@ function ChatView({
                 </button>
                 <button
                   className={`send-button ${
-                    composer.trim() ? "ready" : ""
+                    isResponding
+                      ? "stop"
+                      : composer.trim()
+                        ? "ready"
+                        : ""
                   }`}
-                  onClick={onSend}
-                  aria-label="发送"
+                  onClick={isResponding ? onStop : onSend}
+                  aria-label={isResponding ? "停止生成" : "发送"}
                 >
-                  {composer.trim() ? (
+                  {isResponding ? (
+                    <Square size={11} fill="currentColor" />
+                  ) : composer.trim() ? (
                     <ArrowUp size={18} />
                   ) : (
                     <AudioLines size={18} />
