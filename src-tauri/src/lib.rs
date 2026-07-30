@@ -27,8 +27,8 @@ fn apply_custom_headers(
         return Ok(request);
     }
 
-    let headers: Value =
-        serde_json::from_str(trimmed).map_err(|error| format!("自定义请求头 JSON 无效：{error}"))?;
+    let headers: Value = serde_json::from_str(trimmed)
+        .map_err(|error| format!("自定义请求头 JSON 无效：{error}"))?;
     let object = headers
         .as_object()
         .ok_or_else(|| "自定义请求头必须是 JSON 对象".to_string())?;
@@ -98,22 +98,20 @@ async fn send_chat_message(
     } else {
         api_path.trim()
     };
-    let mut request = client
-        .post(provider_url(&base_url, path))
-        .json(&json!({
-            "model": model,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": "你是漫剧制作 Agent。请用简洁、专业的中文回复，并明确下一步可执行动作。"
-                },
-                {
-                    "role": "user",
-                    "content": input
-                }
-            ],
-            "stream": false
-        }));
+    let mut request = client.post(provider_url(&base_url, path)).json(&json!({
+        "model": model,
+        "messages": [
+            {
+                "role": "system",
+                "content": "你是漫剧制作 Agent。请用简洁、专业的中文回复，并明确下一步可执行动作。"
+            },
+            {
+                "role": "user",
+                "content": input
+            }
+        ],
+        "stream": false
+    }));
 
     if !api_key.trim().is_empty() {
         request = request.bearer_auth(api_key.trim());
@@ -173,8 +171,7 @@ async fn save_project_source(
         .join(safe_project_id)
         .join("source");
 
-    std::fs::create_dir_all(&project_dir)
-        .map_err(|error| format!("无法创建项目目录：{error}"))?;
+    std::fs::create_dir_all(&project_dir).map_err(|error| format!("无法创建项目目录：{error}"))?;
     let path = project_dir.join(safe_file_name);
     std::fs::write(&path, content).map_err(|error| format!("无法保存文件：{error}"))?;
 
@@ -184,6 +181,7 @@ async fn save_project_source(
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             test_model_endpoint,
             send_chat_message,

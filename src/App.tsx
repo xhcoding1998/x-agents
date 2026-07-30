@@ -50,7 +50,6 @@ import {
   SpotlightSurface,
 } from "./components/MicroInteractions";
 
-type ViewMode = "chat" | "settings";
 type ModelKind = "chat" | "image" | "video";
 type ResourceCategory =
   | "原著"
@@ -71,6 +70,7 @@ type Message = {
 type Thread = {
   id: string;
   title: string;
+  projectId: string | null;
   createdAt: number;
   updatedAt: number;
   messages: Message[];
@@ -90,14 +90,15 @@ type ProjectResource = {
 type Project = {
   id: string;
   name: string;
+  rootPath: string;
   createdAt: number;
   updatedAt: number;
-  threads: Thread[];
   resources: ProjectResource[];
 };
 
 type WorkspaceState = {
   projects: Project[];
+  threads: Thread[];
 };
 
 type ModelConfig = {
@@ -119,13 +120,13 @@ type WorkspaceSearchItem = {
   title: string;
   meta: string;
   timestamp: number;
-  projectId: string;
+  projectId?: string;
   threadId?: string;
   resourceId?: string;
   category?: ResourceCategory;
 };
 
-const emptyWorkspace: WorkspaceState = { projects: [] };
+const emptyWorkspace: WorkspaceState = { projects: [], threads: [] };
 
 const defaultModelConfigs: ModelConfigs = {
   chat: {
@@ -181,27 +182,114 @@ function createMessage(
   return { id: createId(), role, content, createdAt: Date.now() };
 }
 
-function createThread(title = "新对话"): Thread {
+function createThread(
+  projectId: string | null = null,
+  title = "新任务",
+): Thread {
   const now = Date.now();
   return {
     id: createId(),
     title,
+    projectId,
     createdAt: now,
     updatedAt: now,
     messages: [],
   };
 }
 
-function createProject(name: string): Project {
+function folderName(path: string) {
+  const normalized = path.replace(/[\\/]+$/, "");
+  return normalized.split(/[\\/]/).pop() || "未命名文件夹";
+}
+
+function createProject(rootPath: string): Project {
   const now = Date.now();
   return {
     id: createId(),
-    name,
+    name: folderName(rootPath),
+    rootPath,
     createdAt: now,
     updatedAt: now,
-    threads: [createThread()],
     resources: [],
   };
+}
+
+function normalizeWorkspace(value: unknown): WorkspaceState {
+  if (!value || typeof value !== "object") return emptyWorkspace;
+  const raw = value as {
+    projects?: Array<
+      Partial<Project> & {
+        threads?: Thread[];
+      }
+    >;
+    threads?: Thread[];
+  };
+  const rawProjects = Array.isArray(raw.projects) ? raw.projects : [];
+  const projects: Project[] = rawProjects
+    .filter((project) => typeof project.id === "string")
+    .map((project) => ({
+      id: project.id as string,
+      name:
+        typeof project.name === "string" ? project.name : "未命名文件夹",
+      rootPath:
+        typeof project.rootPath === "string" ? project.rootPath : "",
+      createdAt:
+        typeof project.createdAt === "number"
+          ? project.createdAt
+          : Date.now(),
+      updatedAt:
+        typeof project.updatedAt === "number"
+          ? project.updatedAt
+          : Date.now(),
+      resources: Array.isArray(project.resources)
+        ? project.resources
+        : [],
+    }));
+
+  const migratedThreads = rawProjects.flatMap((project) =>
+    Array.isArray(project.threads)
+      ? project.threads.map((thread) => ({
+          ...thread,
+          projectId: project.id ?? null,
+        }))
+      : [],
+  );
+  const directThreads = Array.isArray(raw.threads)
+    ? raw.threads.map((thread) => ({
+        ...thread,
+        projectId:
+          typeof thread.projectId === "string"
+            ? thread.projectId
+            : null,
+      }))
+    : [];
+
+  return {
+    projects,
+    threads: directThreads.length > 0 ? directThreads : migratedThreads,
+  };
+}
+
+function useWorkspaceState() {
+  const [value, setValue] = useState<WorkspaceState>(() => {
+    try {
+      const raw =
+        window.localStorage.getItem("manju-agent-workspace-v3") ??
+        window.localStorage.getItem("manju-agent-workspace-v2");
+      return raw ? normalizeWorkspace(JSON.parse(raw)) : emptyWorkspace;
+    } catch {
+      return emptyWorkspace;
+    }
+  });
+
+  useEffect(() => {
+    window.localStorage.setItem(
+      "manju-agent-workspace-v3",
+      JSON.stringify(value),
+    );
+  }, [value]);
+
+  return [value, setValue] as const;
 }
 
 function useStoredState<T>(key: string, initialValue: T) {
@@ -222,10 +310,7 @@ function useStoredState<T>(key: string, initialValue: T) {
 }
 
 function App() {
-  const [workspace, setWorkspace] = useStoredState<WorkspaceState>(
-    "manju-agent-workspace-v2",
-    emptyWorkspace,
-  );
+  const [workspace, setWorkspace] = useWorkspaceState();
   const [modelConfigs, setModelConfigs] = useStoredState<ModelConfigs>(
     "manju-agent-model-configs-v2",
     defaultModelConfigs,
@@ -239,17 +324,15 @@ function App() {
     380,
   );
   const [rightResizing, setRightResizing] = useState(false);
-  const [selectedProjectId, setSelectedProjectId] = useState("");
   const [selectedThreadId, setSelectedThreadId] = useState("");
   const [selectedResourceId, setSelectedResourceId] = useState("");
-  const [viewMode, setViewMode] = useState<ViewMode>("chat");
   const [rightTab, setRightTab] = useState<"files" | "tasks">("files");
   const [activeModelKind, setActiveModelKind] =
     useState<ModelKind>("chat");
   const [composer, setComposer] = useState("");
   const [isResponding, setIsResponding] = useState(false);
-  const [projectDialogOpen, setProjectDialogOpen] = useState(false);
   const [searchDialogOpen, setSearchDialogOpen] = useState(false);
+  const [settingsDialogOpen, setSettingsDialogOpen] = useState(false);
   const [resourcePreviewOpen, setResourcePreviewOpen] = useState(false);
   const [toast, setToast] = useState("");
   const [testState, setTestState] = useState<{
@@ -310,20 +393,20 @@ function App() {
     window.addEventListener("pointercancel", finishResize);
   };
 
+  const selectedThread = useMemo(
+    () =>
+      workspace.threads.find(
+        (thread) => thread.id === selectedThreadId,
+      ) ?? null,
+    [selectedThreadId, workspace.threads],
+  );
+
   const selectedProject = useMemo(
     () =>
       workspace.projects.find(
-        (project) => project.id === selectedProjectId,
+        (project) => project.id === selectedThread?.projectId,
       ) ?? null,
-    [selectedProjectId, workspace.projects],
-  );
-
-  const selectedThread = useMemo(
-    () =>
-      selectedProject?.threads.find(
-        (thread) => thread.id === selectedThreadId,
-      ) ?? null,
-    [selectedProject, selectedThreadId],
+    [selectedThread?.projectId, workspace.projects],
   );
 
   const selectedResource = useMemo(
@@ -335,11 +418,10 @@ function App() {
   );
 
   useEffect(() => {
-    if (!selectedProjectId && workspace.projects[0]) {
-      setSelectedProjectId(workspace.projects[0].id);
-      setSelectedThreadId(workspace.projects[0].threads[0]?.id ?? "");
+    if (!selectedThreadId && workspace.threads[0]) {
+      setSelectedThreadId(workspace.threads[0].id);
     }
-  }, [selectedProjectId, workspace.projects]);
+  }, [selectedThreadId, workspace.threads]);
 
   useEffect(() => {
     if (!toast) return;
@@ -366,48 +448,84 @@ function App() {
     update: (project: Project) => Project,
   ) => {
     setWorkspace((current) => ({
+      ...current,
       projects: current.projects.map((project) =>
         project.id === projectId ? update(project) : project,
       ),
     }));
   };
 
-  const selectProject = (project: Project) => {
-    setSelectedProjectId(project.id);
-    setSelectedThreadId(project.threads[0]?.id ?? "");
-    setSelectedResourceId("");
-    setViewMode("chat");
-  };
-
-  const addProject = (name: string) => {
-    const trimmedName = name.trim();
-    if (!trimmedName) return;
-    const project = createProject(trimmedName);
+  const updateThread = (
+    threadId: string,
+    update: (thread: Thread) => Thread,
+  ) => {
     setWorkspace((current) => ({
-      projects: [project, ...current.projects],
+      ...current,
+      threads: current.threads.map((thread) =>
+        thread.id === threadId ? update(thread) : thread,
+      ),
     }));
-    setSelectedProjectId(project.id);
-    setSelectedThreadId(project.threads[0].id);
-    setViewMode("chat");
-    setProjectDialogOpen(false);
-    window.setTimeout(() => composerRef.current?.focus(), 0);
   };
 
   const createNewThread = () => {
-    if (!selectedProject) {
-      setProjectDialogOpen(true);
-      return;
-    }
     const thread = createThread();
-    updateProject(selectedProject.id, (project) => ({
-      ...project,
-      updatedAt: Date.now(),
-      threads: [thread, ...project.threads],
+    setWorkspace((current) => ({
+      ...current,
+      threads: [thread, ...current.threads],
     }));
     setSelectedThreadId(thread.id);
-    setViewMode("chat");
+    setSelectedResourceId("");
     setComposer("");
     window.setTimeout(() => composerRef.current?.focus(), 0);
+  };
+
+  const bindThreadToFolder = (rootPath: string) => {
+    const normalizedPath = rootPath.replace(/[\\/]+$/, "");
+    const existingProject = workspace.projects.find(
+      (project) =>
+        project.rootPath.replace(/[\\/]+$/, "").toLocaleLowerCase() ===
+        normalizedPath.toLocaleLowerCase(),
+    );
+    const project = existingProject ?? createProject(normalizedPath);
+    const thread = selectedThread ?? createThread(project.id);
+
+    setWorkspace((current) => ({
+      projects: existingProject
+        ? current.projects
+        : [project, ...current.projects],
+      threads: current.threads.some((item) => item.id === thread.id)
+        ? current.threads.map((item) =>
+            item.id === thread.id
+              ? {
+                  ...item,
+                  projectId: project.id,
+                  updatedAt: Date.now(),
+                }
+              : item,
+          )
+        : [{ ...thread, projectId: project.id }, ...current.threads],
+    }));
+    setSelectedThreadId(thread.id);
+    setSelectedResourceId("");
+    setRightOpen(true);
+    setToast(`已绑定项目文件夹：${project.name}`);
+    window.setTimeout(() => composerRef.current?.focus(), 0);
+  };
+
+  const chooseProjectFolder = async () => {
+    try {
+      const { open } = await import("@tauri-apps/plugin-dialog");
+      const selected = await open({
+        directory: true,
+        multiple: false,
+        title: "选择项目文件夹",
+      });
+      if (typeof selected === "string") {
+        bindThreadToFolder(selected);
+      }
+    } catch (error) {
+      setToast(`无法打开文件夹选择器：${String(error)}`);
+    }
   };
 
   const handleNovelImport = async (file: File | undefined) => {
@@ -419,23 +537,17 @@ function App() {
     }
 
     const content = await file.text();
-    const baseName = file.name.replace(/\.[^.]+$/, "") || "未命名项目";
-    let project = selectedProject;
-
-    if (!project) {
-      project = createProject(baseName);
-      setWorkspace((current) => ({
-        projects: [project as Project, ...current.projects],
-      }));
-      setSelectedProjectId(project.id);
-      setSelectedThreadId(project.threads[0].id);
+    const baseName = file.name.replace(/\.[^.]+$/, "") || "未命名原著";
+    if (!selectedProject) {
+      setToast("请先为当前任务选择项目文件夹");
+      return;
     }
 
     let savedPath = "";
     try {
       const { invoke } = await import("@tauri-apps/api/core");
       savedPath = await invoke<string>("save_project_source", {
-        projectId: project.id,
+        projectId: selectedProject.id,
         fileName: file.name,
         content,
       });
@@ -454,8 +566,9 @@ function App() {
       createdAt: Date.now(),
     };
 
-    const projectId = project.id;
-    const threadId = project.threads[0]?.id ?? createThread().id;
+    const projectId = selectedProject.id;
+    const thread = selectedThread ?? createThread(projectId);
+    const threadId = thread.id;
     updateProject(projectId, (current) => ({
       ...current,
       updatedAt: Date.now(),
@@ -466,31 +579,45 @@ function App() {
             !(item.category === "原著" && item.name === resource.name),
         ),
       ],
-      threads: current.threads.map((thread) =>
-        thread.id === threadId
-          ? {
+    }));
+    setWorkspace((current) => ({
+      ...current,
+      threads: current.threads.some((item) => item.id === threadId)
+        ? current.threads.map((item) =>
+            item.id === threadId
+              ? {
+                  ...item,
+                  title:
+                    item.messages.length === 0
+                      ? `分析《${baseName}》`
+                      : item.title,
+                  updatedAt: Date.now(),
+                  messages: [
+                    ...item.messages,
+                    createMessage(
+                      "system",
+                      `已导入原著文件「${file.name}」，共 ${content.length.toLocaleString()} 个字符。`,
+                    ),
+                  ],
+                }
+              : item,
+          )
+        : [
+            {
               ...thread,
-              title:
-                thread.messages.length === 0
-                  ? `分析《${baseName}》`
-                  : thread.title,
-              updatedAt: Date.now(),
+              title: `分析《${baseName}》`,
               messages: [
-                ...thread.messages,
                 createMessage(
                   "system",
                   `已导入原著文件「${file.name}」，共 ${content.length.toLocaleString()} 个字符。`,
                 ),
               ],
-            }
-          : thread,
-      ),
+            },
+            ...current.threads,
+          ],
     }));
-
-    setSelectedProjectId(projectId);
     setSelectedThreadId(threadId);
     setSelectedResourceId(resource.id);
-    setViewMode("chat");
     setRightTab("files");
     setRightOpen(true);
     setToast("原著已导入当前项目");
@@ -499,10 +626,6 @@ function App() {
   const sendMessage = async () => {
     const input = composer.trim();
     if (!input || isResponding) return;
-    if (!selectedProject) {
-      setProjectDialogOpen(true);
-      return;
-    }
 
     const config = modelConfigs.chat;
     if (
@@ -511,7 +634,7 @@ function App() {
       !config.model.trim()
     ) {
       setActiveModelKind("chat");
-      setViewMode("settings");
+      setSettingsDialogOpen(true);
       setToast("请先配置并启用对话模型");
       return;
     }
@@ -519,28 +642,26 @@ function App() {
     let thread = selectedThread;
     if (!thread) {
       thread = createThread();
-      updateProject(selectedProject.id, (project) => ({
-        ...project,
-        threads: [thread as Thread, ...project.threads],
+      setWorkspace((current) => ({
+        ...current,
+        threads: [thread as Thread, ...current.threads],
       }));
       setSelectedThreadId(thread.id);
     }
 
     const userMessage = createMessage("user", input);
-    const projectId = selectedProject.id;
     const threadId = thread.id;
     setComposer("");
     setIsResponding(true);
 
-    updateProject(projectId, (project) => ({
-      ...project,
-      updatedAt: Date.now(),
-      threads: project.threads.map((item) =>
+    setWorkspace((current) => ({
+      ...current,
+      threads: current.threads.map((item) =>
         item.id === threadId
           ? {
               ...item,
               title:
-                item.title === "新对话"
+                item.title === "新任务"
                   ? input.slice(0, 24)
                   : item.title,
               updatedAt: Date.now(),
@@ -560,39 +681,24 @@ function App() {
         headersJson: config.headers,
         input,
       });
-      updateProject(projectId, (project) => ({
-        ...project,
+      updateThread(threadId, (item) => ({
+        ...item,
         updatedAt: Date.now(),
-        threads: project.threads.map((item) =>
-          item.id === threadId
-            ? {
-                ...item,
-                updatedAt: Date.now(),
-                messages: [
-                  ...item.messages,
-                  createMessage("assistant", reply),
-                ],
-              }
-            : item,
-        ),
+        messages: [
+          ...item.messages,
+          createMessage("assistant", reply),
+        ],
       }));
     } catch (error) {
-      updateProject(projectId, (project) => ({
-        ...project,
-        threads: project.threads.map((item) =>
-          item.id === threadId
-            ? {
-                ...item,
-                messages: [
-                  ...item.messages,
-                  createMessage(
-                    "system",
-                    `模型请求失败：${String(error)}`,
-                  ),
-                ],
-              }
-            : item,
-        ),
+      updateThread(threadId, (item) => ({
+        ...item,
+        messages: [
+          ...item.messages,
+          createMessage(
+            "system",
+            `模型请求失败：${String(error)}`,
+          ),
+        ],
       }));
     } finally {
       setIsResponding(false);
@@ -731,53 +837,36 @@ function App() {
       >
         <LeftSidebar
           projects={workspace.projects}
-          selectedProjectId={selectedProjectId}
+          threads={workspace.threads}
           selectedThreadId={selectedThreadId}
-          activeView={viewMode}
+          settingsActive={settingsDialogOpen}
           onNewThread={createNewThread}
           onSearch={() => setSearchDialogOpen(true)}
-          onOpenSettings={() => setViewMode("settings")}
-          onNewProject={() => setProjectDialogOpen(true)}
-          onSelectProject={selectProject}
-          onSelectThread={(projectId, threadId) => {
-            setSelectedProjectId(projectId);
+          onOpenSettings={() => setSettingsDialogOpen(true)}
+          onSelectThread={(threadId) => {
             setSelectedThreadId(threadId);
-            setViewMode("chat");
+            setSelectedResourceId("");
           }}
         />
 
         <main className="center-pane">
-          {viewMode === "settings" ? (
-            <ModelSettingsView
-              configs={modelConfigs}
-              activeKind={activeModelKind}
-              testState={testState}
-              rightOpen={rightOpen}
-              onChangeKind={setActiveModelKind}
-              onChange={updateModelConfig}
-              onTest={() => void testModelConnection()}
-              onSaved={() => setToast("模型配置已保存在本机")}
-              onToggleRight={() => setRightOpen((open) => !open)}
-            />
-          ) : (
-            <ChatView
-              project={selectedProject}
-              thread={selectedThread}
-              composer={composer}
-              isResponding={isResponding}
-              rightOpen={rightOpen}
-              composerRef={composerRef}
-              onComposerChange={setComposer}
-              onSend={() => void sendMessage()}
-              onCreateProject={() => setProjectDialogOpen(true)}
-              onImport={() => fileInputRef.current?.click()}
-              onOpenSettings={() => {
-                setActiveModelKind("chat");
-                setViewMode("settings");
-              }}
-              onToggleRight={() => setRightOpen((open) => !open)}
-            />
-          )}
+          <ChatView
+            project={selectedProject}
+            thread={selectedThread}
+            composer={composer}
+            isResponding={isResponding}
+            rightOpen={rightOpen}
+            composerRef={composerRef}
+            onComposerChange={setComposer}
+            onSend={() => void sendMessage()}
+            onChooseFolder={() => void chooseProjectFolder()}
+            onImport={() => fileInputRef.current?.click()}
+            onOpenSettings={() => {
+              setActiveModelKind("chat");
+              setSettingsDialogOpen(true);
+            }}
+            onToggleRight={() => setRightOpen((open) => !open)}
+          />
         </main>
 
         <RightSidebar
@@ -807,41 +896,46 @@ function App() {
         }}
       />
 
-      {projectDialogOpen && (
-        <NewProjectDialog
-          onClose={() => setProjectDialogOpen(false)}
-          onCreate={addProject}
-        />
-      )}
-
       {searchDialogOpen && (
         <WorkspaceSearchDialog
           projects={workspace.projects}
+          threads={workspace.threads}
           onClose={() => setSearchDialogOpen(false)}
           onSelectProject={(projectId) => {
-            const project = workspace.projects.find(
-              (item) => item.id === projectId,
+            const thread = workspace.threads.find(
+              (item) => item.projectId === projectId,
             );
-            if (project) selectProject(project);
+            if (thread) setSelectedThreadId(thread.id);
           }}
-          onSelectThread={(projectId, threadId) => {
-            setSelectedProjectId(projectId);
+          onSelectThread={(threadId) => {
             setSelectedThreadId(threadId);
             setSelectedResourceId("");
-            setViewMode("chat");
           }}
           onSelectResource={(projectId, resourceId) => {
-            const project = workspace.projects.find(
-              (item) => item.id === projectId,
+            const thread = workspace.threads.find(
+              (item) => item.projectId === projectId,
             );
-            setSelectedProjectId(projectId);
-            setSelectedThreadId(project?.threads[0]?.id ?? "");
+            if (thread) setSelectedThreadId(thread.id);
             setSelectedResourceId(resourceId);
-            setViewMode("chat");
             setRightTab("files");
             setRightOpen(true);
             setResourcePreviewOpen(true);
           }}
+        />
+      )}
+
+      {settingsDialogOpen && (
+        <SettingsDialog
+          configs={modelConfigs}
+          activeKind={activeModelKind}
+          testState={testState}
+          projectCount={workspace.projects.length}
+          threadCount={workspace.threads.length}
+          onClose={() => setSettingsDialogOpen(false)}
+          onChangeKind={setActiveModelKind}
+          onChange={updateModelConfig}
+          onTest={() => void testModelConnection()}
+          onSaved={() => setToast("模型设置已保存在本机")}
         />
       )}
 
@@ -859,105 +953,89 @@ function App() {
 
 function LeftSidebar({
   projects,
-  selectedProjectId,
+  threads,
   selectedThreadId,
-  activeView,
+  settingsActive,
   onNewThread,
   onSearch,
   onOpenSettings,
-  onNewProject,
-  onSelectProject,
   onSelectThread,
 }: {
   projects: Project[];
-  selectedProjectId: string;
+  threads: Thread[];
   selectedThreadId: string;
-  activeView: ViewMode;
+  settingsActive: boolean;
   onNewThread: () => void;
   onSearch: () => void;
   onOpenSettings: () => void;
-  onNewProject: () => void;
-  onSelectProject: (project: Project) => void;
-  onSelectThread: (projectId: string, threadId: string) => void;
+  onSelectThread: (threadId: string) => void;
 }) {
+  const selectedThread = threads.find(
+    (thread) => thread.id === selectedThreadId,
+  );
+  const recentThreads = threads
+    .filter((thread) => !thread.projectId)
+    .sort((left, right) => right.updatedAt - left.updatedAt);
+
   return (
     <aside className="left-sidebar">
       <div className="brand-row">
-        <div className="brand-button">
-          <span className="brand-mark">
-            <Clapperboard size={15} />
-          </span>
+        <button className="brand-button" aria-label="漫剧 Agent 工作区">
           <span>漫剧 Agent</span>
-        </div>
+          <ChevronDown size={14} />
+        </button>
+        <button
+          className="sidebar-search-button"
+          onClick={onSearch}
+          aria-label="搜索"
+          title="搜索（Ctrl K）"
+        >
+          <Search size={16} />
+        </button>
       </div>
 
       <nav className="primary-nav" aria-label="主要功能">
         <button className="nav-row nav-primary" onClick={onNewThread}>
           <SquarePen size={16} />
-          <span>新建对话</span>
-        </button>
-        <button className="nav-row" onClick={onSearch}>
-          <Search size={16} />
-          <span>搜索</span>
-          <kbd className="nav-shortcut">Ctrl K</kbd>
+          <span>新建任务</span>
         </button>
       </nav>
 
-      <div className="sidebar-section-header">
-        <span>项目</span>
-        <button
-          className="icon-button small"
-          onClick={onNewProject}
-          aria-label="新建项目"
-        >
-          <Plus size={14} />
-        </button>
-      </div>
-
       <div className="project-list">
-        {projects.length === 0 ? (
-          <div className="sidebar-empty">
-            <Folder size={18} />
-            <span>还没有项目</span>
-            <button onClick={onNewProject}>新建项目</button>
-          </div>
-        ) : (
+        <div className="sidebar-section-header">
+          <span>项目</span>
+        </div>
+        {projects.length > 0 && (
           <AnimatedList className="project-list-entries">
             {projects.map((project) => {
-              const selected = project.id === selectedProjectId;
+              const projectThreads = threads
+                .filter((thread) => thread.projectId === project.id)
+                .sort(
+                  (left, right) => right.updatedAt - left.updatedAt,
+                );
+              const selected =
+                selectedThread?.projectId === project.id;
               return (
                 <div className="project-block" key={project.id}>
                   <button
-                    className={`project-row ${selected ? "selected" : ""}`}
-                    onClick={() => onSelectProject(project)}
+                    className={`project-row ${selected ? "current" : ""}`}
+                    onClick={() => {
+                      if (projectThreads[0]) {
+                        onSelectThread(projectThreads[0].id);
+                      }
+                    }}
                   >
-                    {selected ? (
-                      <FolderOpen size={15} />
-                    ) : (
-                      <Folder size={15} />
-                    )}
+                    <Folder size={15} />
                     <span>{project.name}</span>
-                    <ChevronRight
-                      size={13}
-                      className={selected ? "open" : ""}
-                    />
                   </button>
-                  {selected && (
+                  {projectThreads.length > 0 && (
                     <AnimatedList className="thread-list">
-                      {project.threads.map((thread) => (
+                      {projectThreads.map((thread) => (
                         <button
                           key={thread.id}
-                          className={`thread-row ${
-                            thread.id === selectedThreadId &&
-                            activeView === "chat"
-                              ? "selected"
-                              : ""
-                          }`}
-                          onClick={() =>
-                            onSelectThread(project.id, thread.id)
-                          }
+                          className={`thread-row ${thread.id === selectedThreadId ? "selected" : ""}`}
+                          onClick={() => onSelectThread(thread.id)}
                         >
-                          <MessageSquareText size={13} />
                           <span>{thread.title}</span>
                         </button>
                       ))}
@@ -968,20 +1046,36 @@ function LeftSidebar({
             })}
           </AnimatedList>
         )}
+
+        <div className="sidebar-section-header recent-header">
+          <span>最近</span>
+        </div>
+        {recentThreads.length > 0 && (
+          <AnimatedList className="recent-thread-list">
+            {recentThreads.map((thread) => (
+              <button
+                key={thread.id}
+                className={`thread-row recent-thread ${
+                  thread.id === selectedThreadId ? "selected" : ""
+                }`}
+                onClick={() => onSelectThread(thread.id)}
+              >
+                <span>{thread.title}</span>
+              </button>
+            ))}
+          </AnimatedList>
+        )}
       </div>
 
       <button
         className={`workspace-profile ${
-          activeView === "settings" ? "active" : ""
+          settingsActive ? "active" : ""
         }`}
         onClick={onOpenSettings}
       >
         <span className="profile-avatar">M</span>
-        <span>
-          <strong>本地工作区</strong>
-          <small>设置与模型服务</small>
-        </span>
-        <Settings size={15} />
+        <strong>本地工作区</strong>
+        <CircleHelp size={16} />
       </button>
     </aside>
   );
@@ -996,7 +1090,7 @@ function ChatView({
   composerRef,
   onComposerChange,
   onSend,
-  onCreateProject,
+  onChooseFolder,
   onImport,
   onOpenSettings,
   onToggleRight,
@@ -1009,7 +1103,7 @@ function ChatView({
   composerRef: React.RefObject<HTMLTextAreaElement | null>;
   onComposerChange: (value: string) => void;
   onSend: () => void;
-  onCreateProject: () => void;
+  onChooseFolder: () => void;
   onImport: () => void;
   onOpenSettings: () => void;
   onToggleRight: () => void;
@@ -1018,8 +1112,8 @@ function ChatView({
     <section className="chat-view">
       <header className="center-header">
         <div className="center-title">
-          <strong>{thread?.title ?? "新建项目"}</strong>
-          <span>{project?.name ?? "尚未选择项目"}</span>
+          <strong>{thread?.title ?? "新任务"}</strong>
+          <span>{project?.name ?? "未绑定项目文件夹"}</span>
         </div>
         <button
           className="icon-button"
@@ -1035,15 +1129,10 @@ function ChatView({
       </header>
 
       <div className="chat-scroll">
-        {!project ? (
-          <EmptyWorkspace
-            onCreateProject={onCreateProject}
-            onImport={onImport}
-            onOpenSettings={onOpenSettings}
-          />
-        ) : !thread || thread.messages.length === 0 ? (
-          <EmptyThread
-            projectName={project.name}
+        {!thread || thread.messages.length === 0 ? (
+          <EmptyTask
+            project={project}
+            onChooseFolder={onChooseFolder}
             onImport={onImport}
             onOpenSettings={onOpenSettings}
           />
@@ -1085,6 +1174,22 @@ function ChatView({
 
       <footer className="composer-area">
         <SpotlightSurface className="composer">
+          <div className="composer-project-row">
+            <button
+              className={`project-picker ${project ? "selected" : ""}`}
+              onClick={onChooseFolder}
+            >
+              {project ? (
+                <FolderOpen size={15} />
+              ) : (
+                <Folder size={15} />
+              )}
+              <span>
+                {project ? project.name : "选择项目文件夹"}
+              </span>
+              <ChevronDown size={14} />
+            </button>
+          </div>
           <textarea
             ref={composerRef}
             value={composer}
@@ -1096,11 +1201,7 @@ function ChatView({
                 onSend();
               }
             }}
-            placeholder={
-              project
-                ? "向 Agent 描述要完成的任务…"
-                : "请先新建项目或导入小说"
-            }
+            placeholder="向 Agent 描述这轮任务要完成什么…"
           />
           <div className="composer-toolbar">
             <div>
@@ -1144,12 +1245,14 @@ function ChatView({
   );
 }
 
-function EmptyWorkspace({
-  onCreateProject,
+function EmptyTask({
+  project,
+  onChooseFolder,
   onImport,
   onOpenSettings,
 }: {
-  onCreateProject: () => void;
+  project: Project | null;
+  onChooseFolder: () => void;
   onImport: () => void;
   onOpenSettings: () => void;
 }) {
@@ -1158,50 +1261,29 @@ function EmptyWorkspace({
       <span className="empty-mark">
         <Clapperboard size={22} />
       </span>
-      <h1>开始你的第一个漫剧项目</h1>
-      <p>创建空项目，或直接导入小说开始。</p>
+      <h1>{project ? "这轮任务要完成什么？" : "我们开始做什么？"}</h1>
+      <p>
+        {project
+          ? `当前任务已绑定「${project.name}」`
+          : "直接描述任务，或选择一个本地文件夹作为项目上下文。"}
+      </p>
       <div className="empty-actions">
-        <button className="primary-button" onClick={onImport}>
-          <FileUp size={15} />
-          导入小说
+        <button
+          className={project ? "secondary-button" : "primary-button"}
+          onClick={onChooseFolder}
+        >
+          <FolderOpen size={15} />
+          {project ? "更换文件夹" : "选择项目文件夹"}
         </button>
-        <button className="secondary-button" onClick={onCreateProject}>
-          <Plus size={15} />
-          新建项目
-        </button>
+        {project && (
+          <button className="secondary-button" onClick={onImport}>
+            <FileUp size={15} />
+            导入小说
+          </button>
+        )}
         <button className="secondary-button" onClick={onOpenSettings}>
           <Settings size={15} />
           打开设置
-        </button>
-      </div>
-    </FadeContent>
-  );
-}
-
-function EmptyThread({
-  projectName,
-  onImport,
-  onOpenSettings,
-}: {
-  projectName: string;
-  onImport: () => void;
-  onOpenSettings: () => void;
-}) {
-  return (
-    <FadeContent className="empty-main-state compact">
-      <span className="empty-mark">
-        <MessageSquareText size={21} />
-      </span>
-      <h1>{projectName}</h1>
-      <p>输入任务开始对话，或向项目添加原著文件。</p>
-      <div className="empty-actions">
-        <button className="secondary-button" onClick={onImport}>
-          <FileUp size={15} />
-          导入小说
-        </button>
-        <button className="secondary-button" onClick={onOpenSettings}>
-          <Settings size={15} />
-          检查模型设置
         </button>
       </div>
     </FadeContent>
@@ -1314,16 +1396,17 @@ function CustomSelect({
   );
 }
 
-function ModelSettingsView({
+function SettingsDialog({
   configs,
   activeKind,
   testState,
-  rightOpen,
+  projectCount,
+  threadCount,
+  onClose,
   onChangeKind,
   onChange,
   onTest,
   onSaved,
-  onToggleRight,
 }: {
   configs: ModelConfigs;
   activeKind: ModelKind;
@@ -1332,7 +1415,9 @@ function ModelSettingsView({
     kind?: "success" | "error";
     text?: string;
   };
-  rightOpen: boolean;
+  projectCount: number;
+  threadCount: number;
+  onClose: () => void;
   onChangeKind: (kind: ModelKind) => void;
   onChange: <K extends keyof ModelConfig>(
     kind: ModelKind,
@@ -1341,229 +1426,270 @@ function ModelSettingsView({
   ) => void;
   onTest: () => void;
   onSaved: () => void;
-  onToggleRight: () => void;
 }) {
+  const [section, setSection] = useState<"models" | "data">("models");
+  const [closing, setClosing] = useState(false);
   const config = configs[activeKind];
-  return (
-    <section className="settings-view">
-      <header className="center-header">
-        <div className="center-title">
-          <strong>设置</strong>
-          <span>本地工作区与模型服务</span>
-        </div>
-        <button
-          className="icon-button"
-          onClick={onToggleRight}
-          aria-label={rightOpen ? "收起资源栏" : "展开资源栏"}
-        >
-          {rightOpen ? (
-            <PanelRightClose size={18} />
-          ) : (
-            <PanelRightOpen size={18} />
-          )}
-        </button>
-      </header>
+  const requestClose = () => {
+    if (closing) return;
+    setClosing(true);
+    window.setTimeout(onClose, 180);
+  };
 
-      <div className="settings-scroll">
-        <SpotlightSurface className="settings-page">
-          <nav className="model-tabs" aria-label="模型服务类型">
-            <div className="settings-nav-label">模型服务</div>
-            <ModelTab
-              active={activeKind === "chat"}
-              enabled={configs.chat.enabled}
-              icon={<MessageSquareText size={16} />}
-              label="对话模型"
-              description="小说分析和 Agent 对话"
-              onClick={() => onChangeKind("chat")}
-            />
-            <ModelTab
-              active={activeKind === "image"}
-              enabled={configs.image.enabled}
-              icon={<ImageIcon size={16} />}
-              label="生图模型"
-              description="角色、场景和分镜素材"
-              onClick={() => onChangeKind("image")}
-            />
-            <ModelTab
-              active={activeKind === "video"}
-              enabled={configs.video.enabled}
-              icon={<Video size={16} />}
-              label="视频模型"
-              description="图生视频和镜头动态化"
-              onClick={() => onChangeKind("video")}
-            />
+  return (
+    <div
+      className={`modal-backdrop settings-backdrop ${
+        closing ? "closing" : ""
+      }`}
+      onMouseDown={requestClose}
+    >
+      <section
+        className="settings-dialog ui-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-label="设置"
+        onMouseDown={(event) => event.stopPropagation()}
+      >
+        <header className="settings-dialog-header">
+          <strong>设置</strong>
+          <button
+            className="icon-button"
+            onClick={requestClose}
+            aria-label="关闭设置"
+          >
+            <X size={18} />
+          </button>
+        </header>
+
+        <div className="settings-dialog-body">
+          <nav className="settings-dialog-nav" aria-label="设置分类">
+            <button
+              className={section === "models" ? "active" : ""}
+              onClick={() => setSection("models")}
+            >
+              <Settings size={17} />
+              <span>模型服务</span>
+            </button>
+            <button
+              className={section === "data" ? "active" : ""}
+              onClick={() => setSection("data")}
+            >
+              <KeyRound size={17} />
+              <span>数据与安全</span>
+            </button>
           </nav>
 
-          <div key={activeKind} className="model-form view-transition">
-            <div className="model-form-heading">
-              <div>
-                <h2>{config.label}</h2>
-                <p>配置由你提供，客户端不会预设真实模型或密钥。</p>
-              </div>
-              <label className="toggle">
-                <input
-                  type="checkbox"
-                  checked={config.enabled}
-                  onChange={(event) =>
-                    onChange(
-                      activeKind,
-                      "enabled",
-                      event.target.checked,
-                    )
-                  }
-                />
-                <span />
-                启用
-              </label>
-            </div>
+          <div className="settings-dialog-content">
+            {section === "models" ? (
+              <div className="settings-section view-transition">
+                <div className="settings-section-heading">
+                  <h2>模型服务</h2>
+                  <p>
+                    分别配置对话、生图和视频模型。所有字段均由你自行提供。
+                  </p>
+                </div>
 
-            <div className="form-grid">
-              <div className="field">
-                <span>接口协议</span>
-                <CustomSelect
-                  label="接口协议"
-                  value={config.provider}
-                  options={[
-                    "OpenAI 兼容",
-                    "自定义 REST",
-                    ...(activeKind === "image" ? ["ComfyUI"] : []),
-                  ]}
-                  onChange={(value) =>
-                    onChange(
-                      activeKind,
-                      "provider",
-                      value,
-                    )
-                  }
-                />
-              </div>
-
-              <label className="field">
-                <span>模型 ID</span>
-                <input
-                  value={config.model}
-                  onChange={(event) =>
-                    onChange(
-                      activeKind,
-                      "model",
-                      event.target.value,
-                    )
-                  }
-                  placeholder="输入模型 ID"
-                  spellCheck={false}
-                />
-              </label>
-
-              <label className="field span-2">
-                <span>Base URL</span>
-                <input
-                  value={config.baseUrl}
-                  onChange={(event) =>
-                    onChange(
-                      activeKind,
-                      "baseUrl",
-                      event.target.value,
-                    )
-                  }
-                  placeholder="https://api.example.com/v1"
-                  spellCheck={false}
-                />
-              </label>
-
-              <label className="field span-2">
-                <span>请求路径</span>
-                <input
-                  value={config.apiPath}
-                  onChange={(event) =>
-                    onChange(
-                      activeKind,
-                      "apiPath",
-                      event.target.value,
-                    )
-                  }
-                  placeholder="例如：chat/completions"
-                  spellCheck={false}
-                />
-              </label>
-
-              <label className="field span-2">
-                <span>API Key</span>
-                <div className="secret-field">
-                  <KeyRound size={15} />
-                  <input
-                    type="password"
-                    value={config.apiKey}
-                    onChange={(event) =>
-                      onChange(
-                        activeKind,
-                        "apiKey",
-                        event.target.value,
-                      )
-                    }
-                    placeholder="输入你自己的 API Key"
-                    autoComplete="off"
-                    spellCheck={false}
+                <div className="settings-service-tabs" role="tablist">
+                  <ModelTab
+                    active={activeKind === "chat"}
+                    enabled={configs.chat.enabled}
+                    icon={<MessageSquareText size={17} />}
+                    label="对话模型"
+                    description="分析与对话"
+                    onClick={() => onChangeKind("chat")}
+                  />
+                  <ModelTab
+                    active={activeKind === "image"}
+                    enabled={configs.image.enabled}
+                    icon={<ImageIcon size={17} />}
+                    label="生图模型"
+                    description="静态物料"
+                    onClick={() => onChangeKind("image")}
+                  />
+                  <ModelTab
+                    active={activeKind === "video"}
+                    enabled={configs.video.enabled}
+                    icon={<Video size={17} />}
+                    label="视频模型"
+                    description="漫剧镜头"
+                    onClick={() => onChangeKind("video")}
                   />
                 </div>
-              </label>
 
-              <label className="field span-2">
-                <span>自定义请求头（JSON）</span>
-                <textarea
-                  value={config.headers}
-                  onChange={(event) =>
-                    onChange(
-                      activeKind,
-                      "headers",
-                      event.target.value,
-                    )
-                  }
-                  rows={5}
-                  spellCheck={false}
-                  placeholder='{"X-Custom-Header":"value"}'
-                />
-              </label>
-            </div>
+                <div key={activeKind} className="settings-model-form view-transition">
+                  <div className="model-form-heading">
+                    <div>
+                      <h3>{config.label}</h3>
+                      <p>连接兼容接口或你自己的服务。</p>
+                    </div>
+                    <label className="toggle">
+                      <input
+                        type="checkbox"
+                        checked={config.enabled}
+                        onChange={(event) =>
+                          onChange(
+                            activeKind,
+                            "enabled",
+                            event.target.checked,
+                          )
+                        }
+                      />
+                      <span />
+                      启用
+                    </label>
+                  </div>
 
-            <div className="model-form-actions">
-              <button
-                className="secondary-button"
-                onClick={onTest}
-                disabled={testState.loading}
-              >
-                {testState.loading ? (
-                  <RotateCcw size={14} className="spin" />
-                ) : (
-                  <Link2 size={14} />
-                )}
-                {testState.loading ? "正在测试" : "测试连接"}
-              </button>
-              <button className="primary-button" onClick={onSaved}>
-                <Save size={14} />
-                保存配置
-              </button>
-              {testState.text && (
-                <span
-                  className={`test-result ${testState.kind ?? ""}`}
-                >
-                  {testState.kind === "success" ? (
-                    <CheckCircle2 size={14} />
-                  ) : (
-                    <AlertCircle size={14} />
-                  )}
-                  {testState.text}
-                </span>
-              )}
-            </div>
+                  <div className="form-grid">
+                    <div className="field">
+                      <span>接口协议</span>
+                      <CustomSelect
+                        label="接口协议"
+                        value={config.provider}
+                        options={[
+                          "OpenAI 兼容",
+                          "自定义 REST",
+                          ...(activeKind === "image" ? ["ComfyUI"] : []),
+                        ]}
+                        onChange={(value) =>
+                          onChange(activeKind, "provider", value)
+                        }
+                      />
+                    </div>
 
-            <p className="security-note">
-              当前开发版配置保存在本机应用数据中。正式发布前应将 API
-              Key 迁移到系统凭据存储。
-            </p>
+                    <label className="field">
+                      <span>模型 ID</span>
+                      <input
+                        value={config.model}
+                        onChange={(event) =>
+                          onChange(activeKind, "model", event.target.value)
+                        }
+                        placeholder="例如：gpt-5"
+                        spellCheck={false}
+                      />
+                    </label>
+
+                    <label className="field span-2">
+                      <span>Base URL</span>
+                      <input
+                        value={config.baseUrl}
+                        onChange={(event) =>
+                          onChange(activeKind, "baseUrl", event.target.value)
+                        }
+                        placeholder="https://api.example.com/v1"
+                        spellCheck={false}
+                      />
+                    </label>
+
+                    <label className="field span-2">
+                      <span>请求路径</span>
+                      <input
+                        value={config.apiPath}
+                        onChange={(event) =>
+                          onChange(activeKind, "apiPath", event.target.value)
+                        }
+                        placeholder="例如：chat/completions"
+                        spellCheck={false}
+                      />
+                    </label>
+
+                    <label className="field span-2">
+                      <span>API Key</span>
+                      <div className="secret-field">
+                        <KeyRound size={16} />
+                        <input
+                          type="password"
+                          value={config.apiKey}
+                          onChange={(event) =>
+                            onChange(activeKind, "apiKey", event.target.value)
+                          }
+                          placeholder="输入你自己的 API Key"
+                          autoComplete="off"
+                          spellCheck={false}
+                        />
+                      </div>
+                    </label>
+
+                    <label className="field span-2">
+                      <span>自定义请求头（JSON）</span>
+                      <textarea
+                        value={config.headers}
+                        onChange={(event) =>
+                          onChange(activeKind, "headers", event.target.value)
+                        }
+                        rows={3}
+                        spellCheck={false}
+                        placeholder='{"X-Custom-Header":"value"}'
+                      />
+                    </label>
+                  </div>
+
+                  <div className="model-form-actions">
+                    <button
+                      className="secondary-button"
+                      onClick={onTest}
+                      disabled={testState.loading}
+                    >
+                      {testState.loading ? (
+                        <RotateCcw size={15} className="spin" />
+                      ) : (
+                        <Link2 size={15} />
+                      )}
+                      {testState.loading ? "正在测试" : "测试连接"}
+                    </button>
+                    <button className="primary-button" onClick={onSaved}>
+                      <Save size={15} />
+                      保存配置
+                    </button>
+                    {testState.text && (
+                      <span className={`test-result ${testState.kind ?? ""}`}>
+                        {testState.kind === "success" ? (
+                          <CheckCircle2 size={15} />
+                        ) : (
+                          <AlertCircle size={15} />
+                        )}
+                        {testState.text}
+                      </span>
+                    )}
+                  </div>
+                </div>
+              </div>
+            ) : (
+              <div className="settings-section view-transition">
+                <div className="settings-section-heading">
+                  <h2>数据与安全</h2>
+                  <p>管理本机数据的保存方式与凭据安全。</p>
+                </div>
+                <div className="settings-data-card">
+                  <div>
+                    <strong>本地工作区</strong>
+                    <span>任务和项目索引保存在当前设备。</span>
+                  </div>
+                  <div className="settings-data-stats">
+                    <span>
+                      <strong>{threadCount}</strong>
+                      个任务
+                    </span>
+                    <span>
+                      <strong>{projectCount}</strong>
+                      个项目文件夹
+                    </span>
+                  </div>
+                </div>
+                <div className="settings-data-card">
+                  <div>
+                    <strong>API 凭据</strong>
+                    <span>
+                      当前开发版保存在本机应用数据中，正式发布前将迁移到系统凭据存储。
+                    </span>
+                  </div>
+                  <span className="local-only-badge">仅本机</span>
+                </div>
+              </div>
+            )}
           </div>
-        </SpotlightSurface>
-      </div>
-    </section>
+        </div>
+      </section>
+    </div>
   );
 }
 
@@ -1651,8 +1777,8 @@ function RightSidebar({
       </div>
       <header className="right-header">
         <div>
-          <strong>项目资源</strong>
-          <span>{project?.name ?? "尚未选择项目"}</span>
+          <strong>文件与资源</strong>
+          <span>{project?.name ?? "当前任务未绑定文件夹"}</span>
         </div>
       </header>
 
@@ -1688,8 +1814,8 @@ function RightSidebar({
           ) : !project ? (
             <RightEmpty
               icon={<Folder size={20} />}
-              title="尚未选择项目"
-              description="创建项目后管理相关资源"
+              title="当前任务未绑定文件夹"
+              description="在输入框上方选择文件夹后，这里会显示项目资源"
             />
           ) : groups.length === 0 ? (
             <RightEmpty
@@ -1823,15 +1949,17 @@ function StatusToast({ message }: { message: string }) {
 
 function WorkspaceSearchDialog({
   projects,
+  threads,
   onClose,
   onSelectProject,
   onSelectThread,
   onSelectResource,
 }: {
   projects: Project[];
+  threads: Thread[];
   onClose: () => void;
   onSelectProject: (projectId: string) => void;
-  onSelectThread: (projectId: string, threadId: string) => void;
+  onSelectThread: (threadId: string) => void;
   onSelectResource: (projectId: string, resourceId: string) => void;
 }) {
   const [query, setQuery] = useState("");
@@ -1839,26 +1967,16 @@ function WorkspaceSearchDialog({
   const [closing, setClosing] = useState(false);
 
   const allItems = useMemo<WorkspaceSearchItem[]>(
-    () =>
-      projects
-        .flatMap((project) => [
+    () => {
+      const projectItems = projects.flatMap((project) => [
           {
             id: `project-${project.id}`,
             kind: "project" as const,
             title: project.name,
-            meta: `${project.threads.length} 个对话 · ${project.resources.length} 个文件`,
+            meta: `${threads.filter((thread) => thread.projectId === project.id).length} 个任务 · ${project.resources.length} 个文件`,
             timestamp: project.updatedAt,
             projectId: project.id,
           },
-          ...project.threads.map((thread) => ({
-            id: `thread-${thread.id}`,
-            kind: "thread" as const,
-            title: thread.title,
-            meta: project.name,
-            timestamp: thread.updatedAt,
-            projectId: project.id,
-            threadId: thread.id,
-          })),
           ...project.resources.map((resource) => ({
             id: `resource-${resource.id}`,
             kind: "resource" as const,
@@ -1869,9 +1987,26 @@ function WorkspaceSearchDialog({
             resourceId: resource.id,
             category: resource.category,
           })),
-        ])
-        .sort((left, right) => right.timestamp - left.timestamp),
-    [projects],
+        ]);
+      const threadItems = threads.map((thread) => {
+        const project = projects.find(
+          (item) => item.id === thread.projectId,
+        );
+        return {
+          id: `thread-${thread.id}`,
+          kind: "thread" as const,
+          title: thread.title,
+          meta: project?.name ?? "未绑定项目文件夹",
+          timestamp: thread.updatedAt,
+          projectId: project?.id,
+          threadId: thread.id,
+        };
+      });
+      return [...projectItems, ...threadItems].sort(
+        (left, right) => right.timestamp - left.timestamp,
+      );
+    },
+    [projects, threads],
   );
 
   const results = useMemo(() => {
@@ -1901,10 +2036,14 @@ function WorkspaceSearchDialog({
     setClosing(true);
     window.setTimeout(() => {
       if (item.kind === "project") {
-        onSelectProject(item.projectId);
+        if (item.projectId) onSelectProject(item.projectId);
       } else if (item.kind === "thread" && item.threadId) {
-        onSelectThread(item.projectId, item.threadId);
-      } else if (item.kind === "resource" && item.resourceId) {
+        onSelectThread(item.threadId);
+      } else if (
+        item.kind === "resource" &&
+        item.projectId &&
+        item.resourceId
+      ) {
         onSelectResource(item.projectId, item.resourceId);
       }
       onClose();
@@ -1948,8 +2087,8 @@ function WorkspaceSearchDialog({
                 selectItem(results[activeIndex]);
               }
             }}
-            placeholder="搜索项目、对话和文件"
-            aria-label="搜索项目、对话和文件"
+            placeholder="搜索任务、项目文件夹和文件"
+            aria-label="搜索任务、项目文件夹和文件"
           />
           <kbd>Esc</kbd>
         </div>
@@ -1959,14 +2098,14 @@ function WorkspaceSearchDialog({
             <FadeContent className="search-empty">
               <Search size={22} />
               <strong>
-                {projects.length === 0
+                {projects.length === 0 && threads.length === 0
                   ? "工作区还没有可搜索内容"
                   : "没有找到相关内容"}
               </strong>
               <span>
-                {projects.length === 0
-                  ? "创建项目或导入小说后，可在这里快速查找"
-                  : "尝试输入其他项目、对话或文件名称"}
+                {projects.length === 0 && threads.length === 0
+                  ? "创建一轮任务后，可在这里快速查找"
+                  : "尝试输入其他任务、文件夹或文件名称"}
               </span>
             </FadeContent>
           ) : (
@@ -2002,9 +2141,9 @@ function WorkspaceSearchDialog({
                     </span>
                     <span className="search-result-kind">
                       {item.kind === "project"
-                        ? "项目"
+                        ? "文件夹"
                         : item.kind === "thread"
-                          ? "对话"
+                          ? "任务"
                           : "文件"}
                     </span>
                   </button>
@@ -2024,76 +2163,6 @@ function WorkspaceSearchDialog({
             <kbd>Enter</kbd>
             打开
           </span>
-        </footer>
-      </section>
-    </div>
-  );
-}
-
-function NewProjectDialog({
-  onClose,
-  onCreate,
-}: {
-  onClose: () => void;
-  onCreate: (name: string) => void;
-}) {
-  const [name, setName] = useState("");
-  const [closing, setClosing] = useState(false);
-  const requestClose = () => {
-    if (closing) return;
-    setClosing(true);
-    window.setTimeout(onClose, 180);
-  };
-  const requestCreate = () => {
-    if (!name.trim() || closing) return;
-    setClosing(true);
-    window.setTimeout(() => onCreate(name), 180);
-  };
-  return (
-    <div
-      className={`modal-backdrop ${closing ? "closing" : ""}`}
-      onMouseDown={requestClose}
-    >
-      <section
-        className="small-dialog ui-dialog"
-        role="dialog"
-        aria-modal="true"
-        aria-label="新建项目"
-        onMouseDown={(event) => event.stopPropagation()}
-      >
-        <header>
-          <div>
-            <strong>新建项目</strong>
-            <span>创建一个空的漫剧制作空间</span>
-          </div>
-          <button className="icon-button" onClick={requestClose}>
-            <X size={16} />
-          </button>
-        </header>
-        <label className="field">
-          <span>项目名称</span>
-          <input
-            autoFocus
-            value={name}
-            onChange={(event) => setName(event.target.value)}
-            onKeyDown={(event) => {
-              if (event.key === "Enter") requestCreate();
-              if (event.key === "Escape") requestClose();
-            }}
-            placeholder="输入项目名称"
-          />
-        </label>
-        <footer>
-          <button className="secondary-button" onClick={requestClose}>
-            取消
-          </button>
-          <button
-            className="primary-button"
-            disabled={!name.trim()}
-            onClick={requestCreate}
-          >
-            创建项目
-          </button>
         </footer>
       </section>
     </div>
