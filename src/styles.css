@@ -1674,7 +1674,9 @@ button:focus-visible {
   width: 100%;
   min-height: 104px;
   position: relative;
-  z-index: 1;
+  /* Keep composer popovers above the closed project-context row.
+     The project picker raises itself to 32 while its own menu is open. */
+  z-index: 4;
   overflow: visible;
   border: 1px solid #dedede;
   border-radius: 18px;
