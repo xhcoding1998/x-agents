@@ -11,6 +11,7 @@ import {
   CircleHelp,
   Clapperboard,
   Clock3,
+  Copy,
   File,
   FileText,
   FileUp,
@@ -140,6 +141,7 @@ type Project = {
   id: string;
   name: string;
   rootPath: string;
+  managed?: boolean;
   createdAt: number;
   updatedAt: number;
   resources: ProjectResource[];
@@ -556,12 +558,19 @@ function folderName(path: string) {
   return normalized.split(/[\\/]/).pop() || "未命名文件夹";
 }
 
+function isManagedProject(
+  project: Pick<Project, "managed" | "rootPath">,
+) {
+  return project.managed === true || /[\\/]outputs[\\/]/i.test(project.rootPath);
+}
+
 function createProject(rootPath: string): Project {
   const now = Date.now();
   return {
     id: createId(),
     name: folderName(rootPath),
     rootPath,
+    managed: false,
     createdAt: now,
     updatedAt: now,
     resources: [],
@@ -581,24 +590,33 @@ function normalizeWorkspace(value: unknown): WorkspaceState {
   const rawProjects = Array.isArray(raw.projects) ? raw.projects : [];
   const projects: Project[] = rawProjects
     .filter((project) => typeof project.id === "string")
-    .map((project) => ({
-      id: project.id as string,
-      name:
-        typeof project.name === "string" ? project.name : "未命名文件夹",
-      rootPath:
-        typeof project.rootPath === "string" ? project.rootPath : "",
-      createdAt:
-        typeof project.createdAt === "number"
-          ? project.createdAt
-          : Date.now(),
-      updatedAt:
-        typeof project.updatedAt === "number"
-          ? project.updatedAt
-          : Date.now(),
-      resources: Array.isArray(project.resources)
-        ? project.resources
-        : [],
-    }));
+    .map((project) => {
+      const rootPath =
+        typeof project.rootPath === "string" ? project.rootPath : "";
+      return {
+        id: project.id as string,
+        name:
+          typeof project.name === "string"
+            ? project.name
+            : "未命名文件夹",
+        rootPath,
+        managed: isManagedProject({
+          managed: project.managed,
+          rootPath,
+        }),
+        createdAt:
+          typeof project.createdAt === "number"
+            ? project.createdAt
+            : Date.now(),
+        updatedAt:
+          typeof project.updatedAt === "number"
+            ? project.updatedAt
+            : Date.now(),
+        resources: Array.isArray(project.resources)
+          ? project.resources
+          : [],
+      };
+    });
 
   const projectIds = new Set(projects.map((project) => project.id));
   const normalizeThread = (
@@ -668,8 +686,19 @@ function normalizeWorkspace(value: unknown): WorkspaceState {
       thread.title !== "新任务",
   );
 
+  const synchronizedProjects = projects.map((project) => {
+    if (!isManagedProject(project)) return project;
+    const conversationTitle = threads
+      .filter((thread) => thread.projectId === project.id)
+      .sort((left, right) => right.updatedAt - left.updatedAt)
+      .find((thread) => thread.title !== "新任务")?.title;
+    return conversationTitle
+      ? { ...project, name: conversationTitle }
+      : project;
+  });
+
   return {
-    projects,
+    projects: synchronizedProjects,
     threads,
   };
 }
@@ -1103,6 +1132,28 @@ function App() {
     }
   };
 
+  const openCurrentProjectFolder = async () => {
+    if (!selectedProject) return;
+    try {
+      const { invoke } = await import("@tauri-apps/api/core");
+      await invoke<void>("open_project_folder", {
+        path: selectedProject.rootPath,
+      });
+    } catch (error) {
+      setToast(`无法打开项目目录：${String(error)}`);
+    }
+  };
+
+  const copyCurrentProjectPath = async () => {
+    if (!selectedProject) return;
+    try {
+      await navigator.clipboard.writeText(selectedProject.rootPath);
+      setToast("项目目录已复制");
+    } catch (error) {
+      setToast(`无法复制项目目录：${String(error)}`);
+    }
+  };
+
   const requestManagedOutputAccess = (action: string) =>
     new Promise<boolean>((resolve) => {
       setManagedOutputApproval({ action, resolve });
@@ -1144,12 +1195,15 @@ function App() {
       const rootPath = await invoke<string>("create_managed_output", {
         projectId,
       });
-      const now = new Date();
-      const outputName = `应用输出 · ${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")} ${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`;
+      const outputName =
+        selectedThread && selectedThread.title !== "新任务"
+          ? selectedThread.title
+          : "新任务";
       const project: Project = {
         id: projectId,
         name: outputName,
         rootPath,
+        managed: true,
         createdAt: Date.now(),
         updatedAt: Date.now(),
         resources: [],
@@ -1172,7 +1226,7 @@ function App() {
       }));
       setSelectedThreadId(thread.id);
       setRightOpen(true);
-      setToast(`已创建应用托管工作区：${outputName}`);
+      setToast("已为当前对话创建应用托管输出目录");
       return { project, thread: { ...thread, projectId: project.id } };
     } catch (error) {
       setToast(`无法创建应用输出目录：${String(error)}`);
@@ -1221,6 +1275,9 @@ function App() {
     const threadId = thread.id;
     updateProject(projectId, (current) => ({
       ...current,
+      name: isManagedProject(current)
+        ? `分析《${baseName}》`
+        : current.name,
       updatedAt: Date.now(),
       resources: [
         resource,
@@ -1390,6 +1447,8 @@ function App() {
     if (!content.trim()) throw new Error("小说内容不能为空");
 
     const fileName = normalizeNovelFileName(title);
+    const novelTitle = fileName.replace(/\.(txt|md|markdown)$/i, "");
+    const conversationTitle = `创作《${novelTitle}》`;
     const { invoke } = await import("@tauri-apps/api/core");
     const savedPath = await invoke<string>("save_project_source", {
       projectId: selectedProject.id,
@@ -1413,6 +1472,9 @@ function App() {
 
     updateProject(selectedProject.id, (project) => ({
       ...project,
+      name: isManagedProject(project)
+        ? conversationTitle
+        : project.name,
       updatedAt: Date.now(),
       resources: [
         resource,
@@ -1424,6 +1486,10 @@ function App() {
     if (selectedThread) {
       updateThread(selectedThread.id, (thread) => ({
         ...thread,
+        title:
+          thread.title === "新任务"
+            ? conversationTitle
+            : thread.title,
         updatedAt: Date.now(),
         messages: [
           ...thread.messages,
@@ -1571,9 +1637,20 @@ function App() {
       userMessage,
       ...(guideMessage ? [guideMessage] : []),
     ];
+    const conversationTitle =
+      thread.title === "新任务" ? input.slice(0, 24) : thread.title;
     setComposer("");
     setWorkspace((current) => ({
       ...current,
+      projects: current.projects.map((project) =>
+        project.id === thread.projectId && isManagedProject(project)
+          ? {
+              ...project,
+              name: conversationTitle,
+              updatedAt: Date.now(),
+            }
+          : project,
+      ),
       threads: current.threads.some((item) => item.id === threadId)
         ? current.threads.map((item) =>
             item.id === threadId
@@ -1581,7 +1658,7 @@ function App() {
                   ...item,
                   title:
                     item.title === "新任务"
-                      ? input.slice(0, 24)
+                      ? conversationTitle
                       : item.title,
                   updatedAt: Date.now(),
                   messages: [
@@ -1594,7 +1671,7 @@ function App() {
         : [
             {
               ...thread,
-              title: input.slice(0, 24),
+              title: conversationTitle,
               updatedAt: Date.now(),
               messages: messagesToAppend,
             },
@@ -2067,6 +2144,10 @@ function App() {
             onStop={stopGeneration}
             onInterruptAndSend={interruptAndSendGuidance}
             onChooseFolder={() => void chooseProjectFolder()}
+            onOpenProjectFolder={() =>
+              void openCurrentProjectFolder()
+            }
+            onCopyProjectPath={() => void copyCurrentProjectPath()}
             onAccessModeChange={(mode) => {
               setAccessMode(mode);
               setToast(`权限已切换为“${accessModeLabel(mode)}”`);
@@ -2092,6 +2173,7 @@ function App() {
 
         <RightSidebar
           project={selectedProject}
+          thread={selectedThread}
           activeTab={rightTab}
           selectedResourceId={selectedResourceId}
           isOpen={rightOpen}
@@ -2587,6 +2669,10 @@ function LeftSidebar({
                       (left, right) =>
                         right.updatedAt - left.updatedAt,
                     );
+                  const projectTitle =
+                    isManagedProject(project) && projectThreads[0]
+                      ? projectThreads[0].title
+                      : project.name;
                   const selected =
                     selectedThread?.projectId === project.id;
                   const collapsed =
@@ -2602,7 +2688,7 @@ function LeftSidebar({
                         onClick={() => toggleProject(project.id)}
                       >
                         <Folder size={15} />
-                        <span>{project.name}</span>
+                        <span title={project.rootPath}>{projectTitle}</span>
                         <ChevronRight
                           size={13}
                           className={collapsed ? "" : "open"}
@@ -2786,6 +2872,8 @@ function ChatView({
   onStop,
   onInterruptAndSend,
   onChooseFolder,
+  onOpenProjectFolder,
+  onCopyProjectPath,
   onAccessModeChange,
   onImport,
   onCreateAiNovel,
@@ -2811,6 +2899,8 @@ function ChatView({
   onStop: () => void;
   onInterruptAndSend: () => void;
   onChooseFolder: () => void;
+  onOpenProjectFolder: () => void;
+  onCopyProjectPath: () => void;
   onAccessModeChange: (mode: AccessMode) => void;
   onImport: () => void;
   onCreateAiNovel: () => void;
@@ -2825,8 +2915,10 @@ function ChatView({
   const previousThreadIdRef = useRef(thread?.id ?? "");
   const previousRespondingRef = useRef(false);
   const sourceMenuRef = useRef<HTMLDivElement>(null);
+  const projectMenuRef = useRef<HTMLDivElement>(null);
   const [followingOutput, setFollowingOutput] = useState(true);
   const [sourceMenuOpen, setSourceMenuOpen] = useState(false);
+  const [projectMenuOpen, setProjectMenuOpen] = useState(false);
   const activeStreamingMessage =
     streamingMessage?.threadId === thread?.id
       ? streamingMessage
@@ -2849,6 +2941,24 @@ function ChatView({
       window.removeEventListener("keydown", handleKeyDown);
     };
   }, [sourceMenuOpen]);
+
+  useEffect(() => {
+    if (!projectMenuOpen) return;
+    const handlePointerDown = (event: PointerEvent) => {
+      if (!projectMenuRef.current?.contains(event.target as Node)) {
+        setProjectMenuOpen(false);
+      }
+    };
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setProjectMenuOpen(false);
+    };
+    document.addEventListener("pointerdown", handlePointerDown);
+    window.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.removeEventListener("pointerdown", handlePointerDown);
+      window.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [projectMenuOpen]);
 
   const scrollToBottom = (behavior: ScrollBehavior = "auto") => {
     const container = chatScrollRef.current;
@@ -3041,22 +3151,97 @@ function ChatView({
 
       <footer className="composer-area">
         <div className="composer-stack">
-          <button
-            className={`project-context-bar ${
-              project ? "selected" : ""
+          <div
+            ref={projectMenuRef}
+            className={`project-context-picker ${
+              projectMenuOpen ? "open" : ""
             }`}
-            onClick={onChooseFolder}
-            title={project?.rootPath ?? "选择一个本地项目文件夹"}
           >
-            {project ? (
-              <FolderOpen size={15} />
-            ) : (
-              <Folder size={15} />
+            <button
+              type="button"
+              className={`project-context-bar ${
+                project ? "selected" : ""
+              }`}
+              onClick={() =>
+                project
+                  ? setProjectMenuOpen((current) => !current)
+                  : onChooseFolder()
+              }
+              aria-haspopup={project ? "menu" : undefined}
+              aria-expanded={project ? projectMenuOpen : undefined}
+              aria-controls={project ? "project-context-menu" : undefined}
+            >
+              {project ? (
+                <FolderOpen size={15} />
+              ) : (
+                <Folder size={15} />
+              )}
+              <span>
+                {project
+                  ? thread?.title ?? project.name
+                  : "选择项目文件夹"}
+              </span>
+              {project && <ChevronDown size={13} />}
+            </button>
+
+            {project && (
+              <div
+                id="project-context-menu"
+                className="project-context-menu ui-popover"
+                role="menu"
+                aria-label="项目目录"
+                aria-hidden={!projectMenuOpen}
+              >
+                <header>
+                  <span>
+                    {isManagedProject(project)
+                      ? "应用托管输出"
+                      : "本地项目"}
+                  </span>
+                  <strong>{thread?.title ?? project.name}</strong>
+                </header>
+                <div className="project-context-path">
+                  <Folder size={15} />
+                  <code title={project.rootPath}>{project.rootPath}</code>
+                </div>
+                <footer>
+                  <button
+                    type="button"
+                    role="menuitem"
+                    onClick={() => {
+                      setProjectMenuOpen(false);
+                      onOpenProjectFolder();
+                    }}
+                  >
+                    <FolderOpen size={15} />
+                    打开目录
+                  </button>
+                  <button
+                    type="button"
+                    role="menuitem"
+                    onClick={() => {
+                      setProjectMenuOpen(false);
+                      onCopyProjectPath();
+                    }}
+                  >
+                    <Copy size={15} />
+                    复制路径
+                  </button>
+                  <button
+                    type="button"
+                    role="menuitem"
+                    onClick={() => {
+                      setProjectMenuOpen(false);
+                      onChooseFolder();
+                    }}
+                  >
+                    <Folder size={15} />
+                    更换文件夹
+                  </button>
+                </footer>
+              </div>
             )}
-            <span>
-              {project ? project.name : "选择项目文件夹"}
-            </span>
-          </button>
+          </div>
 
           <SpotlightSurface className="composer">
             <textarea
@@ -4129,6 +4314,7 @@ function ModelTab({
 
 function RightSidebar({
   project,
+  thread,
   activeTab,
   selectedResourceId,
   isOpen,
@@ -4139,6 +4325,7 @@ function RightSidebar({
   onResetWidth,
 }: {
   project: Project | null;
+  thread: Thread | null;
   activeTab: "files" | "tasks";
   selectedResourceId: string;
   isOpen: boolean;
@@ -4186,7 +4373,11 @@ function RightSidebar({
         <div>
           <strong>文件与资源</strong>
           <span title={project?.rootPath}>
-            {project?.name ?? "当前任务未绑定文件夹"}
+            {project
+              ? isManagedProject(project)
+                ? thread?.title ?? project.name
+                : project.name
+              : "当前任务未绑定文件夹"}
           </span>
         </div>
       </header>

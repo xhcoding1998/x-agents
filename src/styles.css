@@ -1291,13 +1291,17 @@ button:focus-visible {
   padding-top: 38px;
 }
 
-.project-context-bar {
+.project-context-picker {
   width: calc(100% - 28px);
-  height: 50px;
   position: absolute;
   z-index: 0;
   top: 0;
   left: 14px;
+}
+
+.project-context-bar {
+  width: 100%;
+  height: 50px;
   display: flex;
   align-items: flex-start;
   gap: 8px;
@@ -1328,9 +1332,141 @@ button:focus-visible {
 
 .project-context-bar span {
   min-width: 0;
+  flex: 1;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.project-context-bar > svg:last-child {
+  flex: 0 0 auto;
+  margin-top: 1px;
+  transition: transform var(--motion-base) ease;
+}
+
+.project-context-picker.open .project-context-bar > svg:last-child {
+  transform: rotate(180deg);
+}
+
+.project-context-menu {
+  width: min(520px, 100%);
+  position: absolute;
+  z-index: 88;
+  bottom: calc(100% + 8px);
+  left: 0;
+  padding: 7px;
+  overflow: hidden;
+  border: 1px solid #d5dde5;
+  border-radius: 13px;
+  visibility: hidden;
+  background: rgb(255 255 255 / 99%);
+  box-shadow:
+    0 22px 58px rgb(24 36 48 / 20%),
+    0 2px 8px rgb(24 36 48 / 7%);
+  opacity: 0;
+  transform: translateY(7px) scale(0.985);
+  transform-origin: bottom left;
+  pointer-events: none;
+  transition:
+    opacity var(--motion-fast) ease,
+    transform var(--motion-base) cubic-bezier(0.2, 0.8, 0.2, 1),
+    visibility 0s linear var(--motion-base);
+}
+
+.project-context-picker.open {
+  z-index: 32;
+}
+
+.project-context-picker.open .project-context-menu {
+  visibility: visible;
+  opacity: 1;
+  transform: translateY(0) scale(1);
+  pointer-events: auto;
+  transition-delay: 0s;
+}
+
+.project-context-menu > header {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 8px 10px 9px;
+}
+
+.project-context-menu > header span {
+  color: #87919a;
+  font-size: 10.5px;
+}
+
+.project-context-menu > header strong {
+  overflow: hidden;
+  color: #303941;
+  font-size: 13px;
+  font-weight: 680;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.project-context-path {
+  min-height: 44px;
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  padding: 10px;
+  border: 1px solid #dce4eb;
+  border-radius: 9px;
+  color: #506174;
+  background: #f5f8fb;
+}
+
+.project-context-path svg {
+  flex: 0 0 auto;
+  margin-top: 2px;
+}
+
+.project-context-path code {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: #455462;
+  font-family: "Cascadia Code", "SFMono-Regular", Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.55;
+  user-select: text;
+}
+
+.project-context-menu > footer {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding-top: 6px;
+}
+
+.project-context-menu > footer button {
+  min-height: 34px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 9px;
+  border: 0;
+  border-radius: 8px;
+  color: #4c5964;
+  background: transparent;
+  font-family: inherit;
+  font-size: 11.5px;
+  cursor: pointer;
+  transition:
+    color var(--motion-fast) ease,
+    background-color var(--motion-fast) ease,
+    transform var(--motion-fast) ease;
+}
+
+.project-context-menu > footer button:hover,
+.project-context-menu > footer button:focus-visible {
+  color: #255fbc;
+  background: #edf4ff;
+}
+
+.project-context-menu > footer button:active {
+  transform: scale(0.98);
 }
 
 .composer {

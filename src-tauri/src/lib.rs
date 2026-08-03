@@ -571,6 +571,31 @@ async fn create_managed_output(
 }
 
 #[tauri::command]
+async fn open_project_folder(path: String) -> Result<(), String> {
+    if path.trim().is_empty() {
+        return Err("项目目录为空".into());
+    }
+    let canonical_path = std::fs::canonicalize(Path::new(&path))
+        .map_err(|error| format!("无法访问项目目录：{error}"))?;
+    if !canonical_path.is_dir() {
+        return Err("项目路径不是文件夹".into());
+    }
+
+    #[cfg(target_os = "windows")]
+    let mut command = std::process::Command::new("explorer");
+    #[cfg(target_os = "macos")]
+    let mut command = std::process::Command::new("open");
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut command = std::process::Command::new("xdg-open");
+
+    command
+        .arg(&canonical_path)
+        .spawn()
+        .map_err(|error| format!("无法打开项目目录：{error}"))?;
+    Ok(())
+}
+
+#[tauri::command]
 async fn save_project_source(
     app: tauri::AppHandle,
     project_id: String,
@@ -648,6 +673,7 @@ pub fn run() {
             stream_chat_message,
             cancel_chat_generation,
             create_managed_output,
+            open_project_folder,
             save_project_source,
             read_project_source
         ])
