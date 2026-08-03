@@ -35,6 +35,7 @@ import {
   Save,
   Search,
   Settings,
+  ShieldCheck,
   Sparkles,
   Square,
   SquarePen,
@@ -57,6 +58,7 @@ import {
 } from "./components/MicroInteractions";
 
 type ModelKind = "chat" | "image" | "video";
+type AccessMode = "ask" | "approve" | "full";
 type ResourceCategory =
   | "原著"
   | "故事设定"
@@ -102,6 +104,16 @@ type ActiveGeneration = {
 
 type NovelCreationMode = "ai" | "blank";
 type NovelGenerationMode = "plan" | "chapter" | "short";
+
+type WritableContext = {
+  project: Project;
+  thread: Thread;
+};
+
+type ManagedOutputApproval = {
+  action: string;
+  resolve: (approved: boolean) => void;
+};
 
 type Thread = {
   id: string;
@@ -187,6 +199,35 @@ type SidebarPreferences = {
 };
 
 const emptyWorkspace: WorkspaceState = { projects: [], threads: [] };
+
+const accessModeOptions: Array<{
+  value: AccessMode;
+  label: string;
+  description: string;
+}> = [
+  {
+    value: "ask",
+    label: "请求批准",
+    description: "越过当前项目边界前先征求你的同意",
+  },
+  {
+    value: "approve",
+    label: "替我审批",
+    description: "自动审查操作，但仍限制在已绑定项目内",
+  },
+  {
+    value: "full",
+    label: "完全访问",
+    description: "未绑定项目时自动写入应用托管 outputs",
+  },
+];
+
+function accessModeLabel(mode: AccessMode) {
+  return (
+    accessModeOptions.find((option) => option.value === mode)?.label ??
+    "请求批准"
+  );
+}
 const defaultLeftPanelWidth = 272;
 const minLeftPanelWidth = 232;
 const maxLeftPanelWidth = 380;
@@ -383,6 +424,29 @@ function normalizeNovelFileName(title: string) {
     : `${normalized}.md`;
 }
 
+function isDirectNovelCreationRequest(input: string) {
+  const asksForNovel = /(小说|原著|故事正文)/i.test(input);
+  const asksToCreate = /(写|创作|生成|新建|产出|起草)/i.test(input);
+  const asksForAnalysis =
+    /(分析|拆解|总结|梳理|大纲|目录|角色表|设定|分镜|剧本)/i.test(input);
+  return asksForNovel && asksToCreate && !asksForAnalysis;
+}
+
+function novelTitleFromRequest(input: string) {
+  const quotedTitle = input.match(/[《「“"]([^》」”"]{1,40})[》」”"]/u)?.[1];
+  if (quotedTitle) return quotedTitle;
+  const now = new Date();
+  const stamp = [
+    now.getFullYear(),
+    String(now.getMonth() + 1).padStart(2, "0"),
+    String(now.getDate()).padStart(2, "0"),
+    "-",
+    String(now.getHours()).padStart(2, "0"),
+    String(now.getMinutes()).padStart(2, "0"),
+  ].join("");
+  return `AI 创作小说 ${stamp}`;
+}
+
 function textByteLength(content: string) {
   return new TextEncoder().encode(content).byteLength;
 }
@@ -427,6 +491,8 @@ function modelKindName(kind: ModelKind) {
 function buildAgentSystemPrompt(
   configs: ModelConfigs,
   project: Project | null,
+  accessMode: AccessMode,
+  directNovelRequest = false,
 ) {
   const capability = (kind: ModelKind) => {
     const config = configs[kind];
@@ -444,7 +510,9 @@ function buildAgentSystemPrompt(
         })
         .filter(Boolean)
         .join("、") || "暂无制作资源"
-    : "当前任务未绑定项目文件夹";
+    : accessMode === "full"
+      ? "当前任务未绑定外部文件夹；需要写入时客户端会自动创建应用托管 outputs"
+      : "当前任务未绑定项目文件夹";
 
   return `你是漫剧制作 Agent，负责把小说逐步转化为可生产的漫剧。请用简洁、专业的中文回复，并给出下一步可执行动作。
 
@@ -452,6 +520,7 @@ function buildAgentSystemPrompt(
 - 对话模型：${capability("chat")}
 - 生图模型：${capability("image")}
 - 视频模型：${capability("video")}
+- 权限模式：${accessModeLabel(accessMode)}
 - 当前项目：${project?.name ?? "未绑定"}
 - 已有资源：${resourceSummary}
 
@@ -461,7 +530,9 @@ function buildAgentSystemPrompt(
 3. 角色设定、场景设定和分镜确认后，才进入生图环节，生成角色、场景、分镜等静态物料。
 4. 静态物料和镜头运动方案准备完成后，才进入视频环节；视频模型用于文生视频、图生视频、动态镜头和成片素材。
 5. 缺少对应模型配置时，不得声称已经生成图片或视频；应明确指出缺少的能力并等待客户端引导用户配置。
-6. 不要跳过用户确认直接批量消耗生成额度。`;
+6. 不要跳过用户确认直接批量消耗生成额度。
+7. 权限模式为“完全访问”时，不要要求用户先绑定项目文件夹；客户端会把需要落盘的内容保存到应用托管的 outputs 工作区。
+${directNovelRequest ? "8. 用户这次明确要求直接创作小说正文。只输出可保存的 Markdown 小说正文，不要输出权限提醒、保存说明或操作教程；客户端会在生成完成后自动落盘。" : ""}`;
 }
 
 function createThread(
@@ -645,6 +716,10 @@ function useStoredState<T>(key: string, initialValue: T) {
 
 function App() {
   const [workspace, setWorkspace] = useWorkspaceState();
+  const [accessMode, setAccessMode] = useStoredState<AccessMode>(
+    "manju-agent-access-mode-v1",
+    "ask",
+  );
   const [modelConfigs, setModelConfigs] = useStoredState<ModelConfigs>(
     "manju-agent-model-configs-v2",
     defaultModelConfigs,
@@ -733,6 +808,8 @@ function App() {
   const [resourcePreviewOpen, setResourcePreviewOpen] = useState(false);
   const [novelCreationMode, setNovelCreationMode] =
     useState<NovelCreationMode | null>(null);
+  const [managedOutputApproval, setManagedOutputApproval] =
+    useState<ManagedOutputApproval | null>(null);
   const [toast, setToast] = useState("");
   const [testState, setTestState] = useState<{
     loading: boolean;
@@ -1026,6 +1103,83 @@ function App() {
     }
   };
 
+  const requestManagedOutputAccess = (action: string) =>
+    new Promise<boolean>((resolve) => {
+      setManagedOutputApproval({ action, resolve });
+    });
+
+  const finishManagedOutputApproval = (approved: boolean) => {
+    const pending = managedOutputApproval;
+    if (!pending) return;
+    setManagedOutputApproval(null);
+    pending.resolve(approved);
+  };
+
+  const ensureWritableContext = async (
+    action: string,
+  ): Promise<WritableContext | null> => {
+    if (selectedProject) {
+      return {
+        project: selectedProject,
+        thread: selectedThread ?? createThread(selectedProject.id),
+      };
+    }
+
+    if (accessMode === "approve") {
+      setToast("“替我审批”仅在已绑定项目内自动执行，请先选择项目文件夹");
+      return null;
+    }
+
+    if (accessMode === "ask") {
+      const approved = await requestManagedOutputAccess(action);
+      if (!approved) {
+        setToast("已取消创建应用输出目录");
+        return null;
+      }
+    }
+
+    try {
+      const projectId = createId();
+      const { invoke } = await import("@tauri-apps/api/core");
+      const rootPath = await invoke<string>("create_managed_output", {
+        projectId,
+      });
+      const now = new Date();
+      const outputName = `应用输出 · ${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")} ${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`;
+      const project: Project = {
+        id: projectId,
+        name: outputName,
+        rootPath,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        resources: [],
+      };
+      const thread = selectedThread ?? createThread(project.id);
+
+      setWorkspace((current) => ({
+        projects: [project, ...current.projects],
+        threads: current.threads.some((item) => item.id === thread.id)
+          ? current.threads.map((item) =>
+              item.id === thread.id
+                ? {
+                    ...item,
+                    projectId: project.id,
+                    updatedAt: Date.now(),
+                  }
+                : item,
+            )
+          : [{ ...thread, projectId: project.id }, ...current.threads],
+      }));
+      setSelectedThreadId(thread.id);
+      setRightOpen(true);
+      setToast(`已创建应用托管工作区：${outputName}`);
+      return { project, thread: { ...thread, projectId: project.id } };
+    } catch (error) {
+      setToast(`无法创建应用输出目录：${String(error)}`);
+      return null;
+    }
+  };
+
   const handleNovelImport = async (file: File | undefined) => {
     if (!file) return;
     const extension = file.name.split(".").pop()?.toLowerCase();
@@ -1036,16 +1190,14 @@ function App() {
 
     const content = await file.text();
     const baseName = file.name.replace(/\.[^.]+$/, "") || "未命名原著";
-    if (!selectedProject) {
-      setToast("请先为当前任务选择项目文件夹");
-      return;
-    }
+    const context = await ensureWritableContext("导入并保存这部小说");
+    if (!context) return;
 
     let savedPath = "";
     try {
       const { invoke } = await import("@tauri-apps/api/core");
       savedPath = await invoke<string>("save_project_source", {
-        projectId: selectedProject.id,
+        projectId: context.project.id,
         fileName: file.name,
         content,
       });
@@ -1064,8 +1216,8 @@ function App() {
       createdAt: Date.now(),
     };
 
-    const projectId = selectedProject.id;
-    const thread = selectedThread ?? createThread(projectId);
+    const projectId = context.project.id;
+    const thread = context.thread;
     const threadId = thread.id;
     updateProject(projectId, (current) => ({
       ...current,
@@ -1121,17 +1273,17 @@ function App() {
     setToast("原著已导入当前项目");
   };
 
-  const openNovelCreator = (mode: NovelCreationMode) => {
-    if (!selectedProject) {
-      setToast("请先为当前任务选择项目文件夹");
-      return;
-    }
+  const openNovelCreator = async (mode: NovelCreationMode) => {
     if (mode === "ai" && !isModelConfigured(modelConfigs.chat)) {
       setActiveModelKind("chat");
       setSettingsDialogOpen(true);
       setToast("AI 创作小说前需要先配置对话模型");
       return;
     }
+    const context = await ensureWritableContext(
+      mode === "ai" ? "创作并保存 AI 小说" : "新建并保存空白小说",
+    );
+    if (!context) return;
     setNovelCreationMode(mode);
   };
 
@@ -1289,6 +1441,41 @@ function App() {
     setToast("小说已保存，可随时继续编辑");
   };
 
+  const saveConversationNovel = async (
+    context: WritableContext,
+    request: string,
+    content: string,
+  ) => {
+    const fileName = normalizeNovelFileName(
+      novelTitleFromRequest(request),
+    );
+    const { invoke } = await import("@tauri-apps/api/core");
+    const savedPath = await invoke<string>("save_project_source", {
+      projectId: context.project.id,
+      fileName,
+      content,
+    });
+    const resource: ProjectResource = {
+      id: createId(),
+      name: fileName,
+      category: "原著",
+      kind: "text",
+      size: textByteLength(content),
+      path: savedPath,
+      preview: content.slice(0, 12000),
+      createdAt: Date.now(),
+    };
+    updateProject(context.project.id, (project) => ({
+      ...project,
+      updatedAt: Date.now(),
+      resources: [resource, ...project.resources],
+    }));
+    setSelectedResourceId(resource.id);
+    setRightTab("files");
+    setRightOpen(true);
+    setToast(`小说已自动保存到 ${context.project.name}`);
+  };
+
   const loadResourceContent = async (resource: ProjectResource) => {
     if (!resource.path) return resource.preview ?? "";
     const { invoke } = await import("@tauri-apps/api/core");
@@ -1356,7 +1543,14 @@ function App() {
     ].filter(
       (kind, index, kinds) => kinds.indexOf(kind) === index,
     );
-    const thread = selectedThread ?? createThread();
+    const directNovelRequest = isDirectNovelCreationRequest(input);
+    const writableContext =
+      directNovelRequest && requiredKinds.length === 0
+        ? await ensureWritableContext("创作小说并保存为原著文件")
+        : null;
+    const promptProject = writableContext?.project ?? selectedProject;
+    const thread =
+      writableContext?.thread ?? selectedThread ?? createThread();
     const userMessage = createMessage("user", input);
     const guideMessage =
       requiredKinds.length > 0
@@ -1472,7 +1666,9 @@ function App() {
         input,
         systemPrompt: buildAgentSystemPrompt(
           modelConfigs,
-          selectedProject,
+          promptProject,
+          accessMode,
+          directNovelRequest,
         ),
         onEvent,
       });
@@ -1489,6 +1685,26 @@ function App() {
             createMessage("assistant", completed.content),
           ],
         }));
+        if (directNovelRequest && writableContext) {
+          try {
+            await saveConversationNovel(
+              writableContext,
+              input,
+              completed.content,
+            );
+          } catch (saveError) {
+            updateThread(threadId, (item) => ({
+              ...item,
+              messages: [
+                ...item.messages,
+                createMessage(
+                  "system",
+                  `小说正文已生成，但自动保存失败：${String(saveError)}`,
+                ),
+              ],
+            }));
+          }
+        }
       }
       activeGenerationRef.current = null;
       setStreamingMessage(null);
@@ -1841,6 +2057,7 @@ function App() {
                 : []
             }
             composer={composer}
+            accessMode={accessMode}
             isResponding={isResponding}
             streamingMessage={streamingMessage}
             rightOpen={rightOpen}
@@ -1850,15 +2067,13 @@ function App() {
             onStop={stopGeneration}
             onInterruptAndSend={interruptAndSendGuidance}
             onChooseFolder={() => void chooseProjectFolder()}
-            onImport={() => {
-              if (!selectedProject) {
-                setToast("请先为当前任务选择项目文件夹");
-                return;
-              }
-              fileInputRef.current?.click();
+            onAccessModeChange={(mode) => {
+              setAccessMode(mode);
+              setToast(`权限已切换为“${accessModeLabel(mode)}”`);
             }}
-            onCreateAiNovel={() => openNovelCreator("ai")}
-            onCreateBlankNovel={() => openNovelCreator("blank")}
+            onImport={() => fileInputRef.current?.click()}
+            onCreateAiNovel={() => void openNovelCreator("ai")}
+            onCreateBlankNovel={() => void openNovelCreator("blank")}
             onOpenSettings={() => {
               setActiveModelKind("chat");
               setSettingsDialogOpen(true);
@@ -1967,6 +2182,14 @@ function App() {
           onClose={() => setResourcePreviewOpen(false)}
           onLoad={loadResourceContent}
           onSave={saveResourceContent}
+        />
+      )}
+
+      {managedOutputApproval && (
+        <ManagedOutputApprovalDialog
+          action={managedOutputApproval.action}
+          onCancel={() => finishManagedOutputApproval(false)}
+          onApprove={() => finishManagedOutputApproval(true)}
         />
       )}
 
@@ -2553,6 +2776,7 @@ function ChatView({
   modelName,
   modelOptions,
   composer,
+  accessMode,
   isResponding,
   streamingMessage,
   rightOpen,
@@ -2562,6 +2786,7 @@ function ChatView({
   onStop,
   onInterruptAndSend,
   onChooseFolder,
+  onAccessModeChange,
   onImport,
   onCreateAiNovel,
   onCreateBlankNovel,
@@ -2576,6 +2801,7 @@ function ChatView({
   modelName: string;
   modelOptions: string[];
   composer: string;
+  accessMode: AccessMode;
   isResponding: boolean;
   streamingMessage: StreamingMessage | null;
   rightOpen: boolean;
@@ -2585,6 +2811,7 @@ function ChatView({
   onStop: () => void;
   onInterruptAndSend: () => void;
   onChooseFolder: () => void;
+  onAccessModeChange: (mode: AccessMode) => void;
   onImport: () => void;
   onCreateAiNovel: () => void;
   onCreateBlankNovel: () => void;
@@ -2697,6 +2924,7 @@ function ChatView({
         !activeStreamingMessage ? (
           <EmptyTask
             project={project}
+            accessMode={accessMode}
             onChooseFolder={onChooseFolder}
             onImport={onImport}
             onCreateAiNovel={onCreateAiNovel}
@@ -2818,6 +3046,7 @@ function ChatView({
               project ? "selected" : ""
             }`}
             onClick={onChooseFolder}
+            title={project?.rootPath ?? "选择一个本地项目文件夹"}
           >
             {project ? (
               <FolderOpen size={15} />
@@ -2924,15 +3153,10 @@ function ChatView({
                     </button>
                   </div>
                 </div>
-                <button
-                  className={`access-status ${
-                    project ? "granted" : ""
-                  }`}
-                  onClick={onChooseFolder}
-                >
-                  <AlertCircle size={15} />
-                  {project ? "项目访问" : "未选择文件夹"}
-                </button>
+                <AccessModePicker
+                  value={accessMode}
+                  onChange={onAccessModeChange}
+                />
               </div>
               <div>
                 <ComposerModelPicker
@@ -2975,6 +3199,7 @@ function ChatView({
 
 function EmptyTask({
   project,
+  accessMode,
   onChooseFolder,
   onImport,
   onCreateAiNovel,
@@ -2982,6 +3207,7 @@ function EmptyTask({
   onOpenSettings,
 }: {
   project: Project | null;
+  accessMode: AccessMode;
   onChooseFolder: () => void;
   onImport: () => void;
   onCreateAiNovel: () => void;
@@ -2997,7 +3223,9 @@ function EmptyTask({
       <p>
         {project
           ? `当前任务已绑定「${project.name}」`
-          : "直接描述任务，或选择一个本地文件夹作为项目上下文。"}
+          : accessMode === "full"
+            ? "直接描述任务，首次保存时会自动创建应用托管 outputs 工作区。"
+            : "直接描述任务，或选择一个本地文件夹作为项目上下文。"}
       </p>
       <div className="empty-actions">
         <button
@@ -3007,34 +3235,121 @@ function EmptyTask({
           <FolderOpen size={15} />
           {project ? "更换文件夹" : "选择项目文件夹"}
         </button>
-        {project && (
-          <>
-            <button
-              className="primary-button"
-              onClick={onCreateAiNovel}
-            >
-              <Sparkles size={15} />
-              AI 创作小说
-            </button>
-            <button className="secondary-button" onClick={onImport}>
-              <FileUp size={15} />
-              导入小说
-            </button>
-            <button
-              className="secondary-button"
-              onClick={onCreateBlankNovel}
-            >
-              <SquarePen size={15} />
-              新建空白
-            </button>
-          </>
-        )}
+        <button className="primary-button" onClick={onCreateAiNovel}>
+          <Sparkles size={15} />
+          AI 创作小说
+        </button>
+        <button className="secondary-button" onClick={onImport}>
+          <FileUp size={15} />
+          导入小说
+        </button>
+        <button
+          className="secondary-button"
+          onClick={onCreateBlankNovel}
+        >
+          <SquarePen size={15} />
+          新建空白
+        </button>
         <button className="secondary-button" onClick={onOpenSettings}>
           <Settings size={15} />
           打开设置
         </button>
       </div>
     </FadeContent>
+  );
+}
+
+function AccessModePicker({
+  value,
+  onChange,
+}: {
+  value: AccessMode;
+  onChange: (value: AccessMode) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const rootRef = useRef<HTMLDivElement>(null);
+  const menuId = useRef(`access-mode-${createId()}`).current;
+
+  useEffect(() => {
+    if (!open) return;
+    const handlePointerDown = (event: PointerEvent) => {
+      if (!rootRef.current?.contains(event.target as Node)) {
+        setOpen(false);
+      }
+    };
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setOpen(false);
+    };
+    document.addEventListener("pointerdown", handlePointerDown);
+    window.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.removeEventListener("pointerdown", handlePointerDown);
+      window.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [open]);
+
+  const icon = (mode: AccessMode, size = 15) => {
+    if (mode === "full") return <KeyRound size={size} />;
+    if (mode === "approve") return <ShieldCheck size={size} />;
+    return <CircleHelp size={size} />;
+  };
+
+  return (
+    <div
+      ref={rootRef}
+      className={`access-mode-picker ${open ? "open" : ""}`}
+      data-mode={value}
+    >
+      <button
+        type="button"
+        className="access-status"
+        aria-label="切换权限"
+        aria-haspopup="menu"
+        aria-expanded={open}
+        aria-controls={menuId}
+        onClick={() => setOpen((current) => !current)}
+      >
+        {icon(value)}
+        <span>{accessModeLabel(value)}</span>
+        <ChevronDown size={13} />
+      </button>
+      <div
+        id={menuId}
+        className="access-mode-menu ui-popover"
+        role="menu"
+        aria-label="任务权限"
+        aria-hidden={!open}
+      >
+        <header>
+          <strong>权限</strong>
+          <span>控制 Agent 的文件写入边界</span>
+        </header>
+        <div>
+          {accessModeOptions.map((option) => (
+            <button
+              key={option.value}
+              type="button"
+              role="menuitemradio"
+              aria-checked={value === option.value}
+              className={value === option.value ? "selected" : ""}
+              onClick={() => {
+                onChange(option.value);
+                setOpen(false);
+              }}
+            >
+              <span className="access-mode-option-icon">
+                {icon(option.value, 16)}
+              </span>
+              <span>
+                <strong>{option.label}</strong>
+                <small>{option.description}</small>
+              </span>
+              {value === option.value && <Check size={15} />}
+            </button>
+          ))}
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -3870,7 +4185,9 @@ function RightSidebar({
       <header className="right-header">
         <div>
           <strong>文件与资源</strong>
-          <span>{project?.name ?? "当前任务未绑定文件夹"}</span>
+          <span title={project?.rootPath}>
+            {project?.name ?? "当前任务未绑定文件夹"}
+          </span>
         </div>
       </header>
 
@@ -4013,6 +4330,60 @@ function RightEmpty({
       <strong>{title}</strong>
       <span>{description}</span>
     </FadeContent>
+  );
+}
+
+function ManagedOutputApprovalDialog({
+  action,
+  onCancel,
+  onApprove,
+}: {
+  action: string;
+  onCancel: () => void;
+  onApprove: () => void;
+}) {
+  return (
+    <div
+      className="modal-backdrop permission-approval-backdrop"
+      onMouseDown={onCancel}
+    >
+      <section
+        className="permission-approval-dialog ui-dialog"
+        role="alertdialog"
+        aria-modal="true"
+        aria-labelledby="permission-approval-title"
+        onMouseDown={(event) => event.stopPropagation()}
+      >
+        <span className="permission-approval-icon">
+          <ShieldCheck size={22} />
+        </span>
+        <div>
+          <strong id="permission-approval-title">
+            允许创建应用输出目录？
+          </strong>
+          <p>
+            Agent 需要{action}。当前任务没有绑定文件夹，批准后会在应用托管的
+            <code> outputs </code>工作区中创建并保存文件。
+          </p>
+        </div>
+        <footer>
+          <button
+            type="button"
+            className="secondary-button"
+            onClick={onCancel}
+          >
+            取消
+          </button>
+          <button
+            type="button"
+            className="primary-button"
+            onClick={onApprove}
+          >
+            允许本次操作
+          </button>
+        </footer>
+      </section>
+    </div>
   );
 }
 

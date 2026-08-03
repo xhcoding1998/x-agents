@@ -546,6 +546,31 @@ fn cancel_chat_generation(
 }
 
 #[tauri::command]
+async fn create_managed_output(
+    app: tauri::AppHandle,
+    project_id: String,
+) -> Result<String, String> {
+    let safe_project_id: String = project_id
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric() || *character == '-')
+        .collect();
+    if safe_project_id.is_empty() {
+        return Err("项目 ID 无效".into());
+    }
+
+    let output_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("无法获取应用数据目录：{error}"))?
+        .join("outputs")
+        .join(safe_project_id);
+    std::fs::create_dir_all(output_dir.join("source"))
+        .map_err(|error| format!("无法创建应用输出目录：{error}"))?;
+
+    Ok(output_dir.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
 async fn save_project_source(
     app: tauri::AppHandle,
     project_id: String,
@@ -565,13 +590,19 @@ async fn save_project_source(
         .and_then(|name| name.to_str())
         .ok_or_else(|| "文件名无效".to_string())?;
 
-    let project_dir = app
+    let app_data_dir = app
         .path()
         .app_data_dir()
-        .map_err(|error| format!("无法获取应用数据目录：{error}"))?
-        .join("projects")
-        .join(safe_project_id)
-        .join("source");
+        .map_err(|error| format!("无法获取应用数据目录：{error}"))?;
+    let managed_output_dir = app_data_dir.join("outputs").join(&safe_project_id);
+    let project_dir = if managed_output_dir.exists() {
+        managed_output_dir.join("source")
+    } else {
+        app_data_dir
+            .join("projects")
+            .join(safe_project_id)
+            .join("source")
+    };
 
     std::fs::create_dir_all(&project_dir).map_err(|error| format!("无法创建项目目录：{error}"))?;
     let path = project_dir.join(safe_file_name);
@@ -586,17 +617,20 @@ async fn read_project_source(app: tauri::AppHandle, path: String) -> Result<Stri
         return Err("原著文件路径为空".into());
     }
 
-    let source_root = app
+    let app_data_dir = app
         .path()
         .app_data_dir()
-        .map_err(|error| format!("无法获取应用数据目录：{error}"))?
-        .join("projects");
-    let canonical_root = std::fs::canonicalize(&source_root)
-        .map_err(|error| format!("无法访问项目资源目录：{error}"))?;
+        .map_err(|error| format!("无法获取应用数据目录：{error}"))?;
     let canonical_path = std::fs::canonicalize(Path::new(&path))
         .map_err(|error| format!("无法访问原著文件：{error}"))?;
 
-    if !canonical_path.starts_with(&canonical_root) {
+    let allowed = [app_data_dir.join("projects"), app_data_dir.join("outputs")]
+        .iter()
+        .filter(|root| root.exists())
+        .filter_map(|root| std::fs::canonicalize(root).ok())
+        .any(|root| canonical_path.starts_with(root));
+
+    if !allowed {
         return Err("拒绝读取项目资源目录之外的文件".into());
     }
 
@@ -613,6 +647,7 @@ pub fn run() {
             list_provider_models,
             stream_chat_message,
             cancel_chat_generation,
+            create_managed_output,
             save_project_source,
             read_project_source
         ])

@@ -1507,11 +1507,154 @@ button:focus-visible {
 }
 
 .access-status {
-  color: #e15a28;
+  color: #4d5964;
+  transition:
+    color var(--motion-fast) ease,
+    background-color var(--motion-fast) ease,
+    transform var(--motion-fast) ease;
 }
 
-.access-status.granted {
-  color: #d65a2c;
+.access-mode-picker {
+  position: relative;
+  z-index: 28;
+}
+
+.access-mode-picker[data-mode="approve"] .access-status,
+.access-mode-picker[data-mode="full"] .access-status {
+  color: #2563c7;
+}
+
+.access-mode-picker.open .access-status {
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.access-mode-picker.open .access-status > svg:last-child {
+  transform: rotate(180deg);
+}
+
+.access-status > svg:last-child {
+  transition: transform var(--motion-base) ease;
+}
+
+.access-mode-menu {
+  width: 326px;
+  position: absolute;
+  z-index: 84;
+  bottom: calc(100% + 8px);
+  left: 0;
+  padding: 6px;
+  border: 1px solid #d6dee7;
+  border-radius: 13px;
+  visibility: hidden;
+  background: rgb(255 255 255 / 98%);
+  box-shadow:
+    0 20px 52px rgb(25 38 52 / 19%),
+    0 2px 8px rgb(25 38 52 / 7%);
+  opacity: 0;
+  transform: translateY(7px) scale(0.985);
+  transform-origin: bottom left;
+  pointer-events: none;
+  transition:
+    opacity var(--motion-fast) ease,
+    transform var(--motion-base) cubic-bezier(0.2, 0.8, 0.2, 1),
+    visibility 0s linear var(--motion-base);
+}
+
+.access-mode-picker.open .access-mode-menu {
+  visibility: visible;
+  opacity: 1;
+  transform: translateY(0) scale(1);
+  pointer-events: auto;
+  transition-delay: 0s;
+}
+
+.access-mode-menu > header {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 8px 10px 7px;
+}
+
+.access-mode-menu > header strong {
+  color: #303a43;
+  font-size: 13px;
+  font-weight: 680;
+}
+
+.access-mode-menu > header span {
+  color: #87919a;
+  font-size: 10.5px;
+}
+
+.access-mode-menu > div {
+  display: grid;
+  gap: 2px;
+}
+
+.access-mode-menu > div > button {
+  width: 100%;
+  min-height: 58px;
+  display: grid;
+  grid-template-columns: 30px minmax(0, 1fr) 18px;
+  align-items: center;
+  gap: 9px;
+  padding: 7px 9px;
+  border: 0;
+  border-radius: 9px;
+  color: #4a555f;
+  background: transparent;
+  font-family: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition:
+    color var(--motion-fast) ease,
+    background-color var(--motion-fast) ease,
+    transform var(--motion-fast) ease;
+}
+
+.access-mode-menu > div > button:hover,
+.access-mode-menu > div > button:focus-visible,
+.access-mode-menu > div > button.selected {
+  color: #245fb9;
+  background: #edf4ff;
+}
+
+.access-mode-menu > div > button:active {
+  transform: scale(0.99);
+}
+
+.access-mode-option-icon {
+  width: 30px;
+  height: 30px;
+  display: grid;
+  place-items: center;
+  border-radius: 8px;
+  color: #55718f;
+  background: #f0f4f8;
+}
+
+.access-mode-menu button.selected .access-mode-option-icon {
+  color: #2260c3;
+  background: #dceaff;
+}
+
+.access-mode-menu button > span:nth-child(2) {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.access-mode-menu button strong {
+  font-size: 12.5px;
+  font-weight: 650;
+}
+
+.access-mode-menu button small {
+  color: #84909a;
+  font-size: 10.5px;
+  line-height: 1.35;
 }
 
 .access-status:hover,
@@ -2885,6 +3028,70 @@ button:focus-visible {
   padding: 28px;
   background: rgb(33 39 45 / 34%);
   backdrop-filter: blur(3px);
+}
+
+.permission-approval-backdrop {
+  z-index: 150;
+  background: rgb(34 42 50 / 26%);
+  backdrop-filter: blur(3px);
+}
+
+.permission-approval-dialog {
+  width: min(480px, calc(100vw - 48px));
+  display: grid;
+  grid-template-columns: 42px minmax(0, 1fr);
+  gap: 14px;
+  padding: 22px;
+  border: 1px solid #d5dde5;
+  border-radius: 15px;
+  background: #fff;
+  box-shadow:
+    0 28px 80px rgb(24 35 46 / 24%),
+    0 2px 10px rgb(24 35 46 / 8%);
+}
+
+.permission-approval-icon {
+  width: 42px;
+  height: 42px;
+  display: grid;
+  place-items: center;
+  border-radius: 11px;
+  color: #245fbd;
+  background: #e9f2ff;
+}
+
+.permission-approval-dialog > div {
+  min-width: 0;
+}
+
+.permission-approval-dialog strong {
+  color: #303a43;
+  font-size: 15px;
+  font-weight: 680;
+}
+
+.permission-approval-dialog p {
+  margin: 7px 0 0;
+  color: #68747f;
+  font-size: 12px;
+  line-height: 1.65;
+}
+
+.permission-approval-dialog code {
+  padding: 1px 4px;
+  border-radius: 4px;
+  color: #315f9a;
+  background: #edf4fc;
+  font-family: inherit;
+  font-size: 11.5px;
+}
+
+.permission-approval-dialog > footer {
+  grid-column: 1 / -1;
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 4px;
 }
 
 .settings-dialog {
