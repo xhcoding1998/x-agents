@@ -95,6 +95,12 @@ type StreamingMessage = {
   id: string;
   threadId: string;
   content: string;
+  artifactStatus?: {
+    phase: "planning" | "writing" | "saving";
+    fileName: string;
+    generatedCharacters: number;
+    persistedCharacters: number;
+  };
 };
 
 type ChatStreamEvent = {
@@ -108,6 +114,7 @@ type ActiveGeneration = {
   messageId: string;
   content: string;
   cancelled: boolean;
+  finalizing?: boolean;
   artifact?: ActiveTextArtifact;
 };
 
@@ -124,7 +131,15 @@ type ActiveTextArtifact = {
   resource: ProjectResource;
   baseContent: string;
   lastQueuedLength: number;
+  lastPersistedLength: number;
+  checkpointTimer: number | null;
   writeChain: Promise<ProjectResource>;
+};
+
+type TurnMetadataPlan = {
+  conversationTitle: string;
+  artifactTitle?: string;
+  fileName?: string;
 };
 
 type NovelCreationMode = "ai" | "blank";
@@ -513,37 +528,10 @@ function createTextArtifactIntent(
     return null;
   }
 
-  const quotedTitle = normalized.match(
-    /[《「“"]([^》」”"]{1,40})[》」”"]/u,
-  )?.[1];
-  const conversationTitle =
-    thread?.title && thread.title !== "新任务"
-      ? thread.title
-          .replace(/^(创作|分析)[《「]/, "")
-          .replace(/[》」]$/, "")
-      : "";
-  const compactRequestTitle = normalized
-    .replace(
-      /^(请|麻烦|帮我|给我|直接|现在|开始|来)(再)?/,
-      "",
-    )
-    .replace(
-      /(写|创作|生成|新建|产出|起草|继续写|接着写|续写|扩写)/g,
-      "",
-    )
-    .replace(/[，。！？,.!?]/g, " ")
-    .trim()
-    .slice(0, 28);
-  const title =
-    quotedTitle ||
-    conversationTitle ||
-    compactRequestTitle ||
-    (asksToContinue ? "续写小说" : "未命名小说");
-
   return {
     category: "原著",
-    title,
-    fileName: normalizeNovelFileName(title),
+    title: "",
+    fileName: "",
     operation: asksToContinue ? "continue" : "create",
   };
 }
@@ -673,6 +661,97 @@ function buildAgentSystemPrompt(
 ${artifactIntent ? `8. 本轮是原著文件产物任务，目标文件为“${artifactIntent.fileName}”。客户端已经创建文件并会持续保存你的输出；你只输出可直接写入文件的 Markdown 小说正文，不要输出权限提醒、保存说明、操作教程或“以下是”等开场白。` : ""}`;
 }
 
+function parseTurnMetadataPlan(
+  raw: string,
+  needsArtifact: boolean,
+): TurnMetadataPlan {
+  const jsonMatch = raw.match(/\{[\s\S]*\}/);
+  if (!jsonMatch) throw new Error("模型没有返回任务元数据 JSON");
+  const parsed = JSON.parse(jsonMatch[0]) as Record<string, unknown>;
+  const conversationTitle = String(parsed.conversationTitle ?? "")
+    .replace(/[\r\n]/g, " ")
+    .replace(/^[《「“\"']+|[》」”\"']+$/g, "")
+    .trim()
+    .slice(0, 24);
+  if (!conversationTitle) throw new Error("模型没有生成可用的任务标题");
+
+  if (!needsArtifact) return { conversationTitle };
+
+  const artifactTitle = String(parsed.artifactTitle ?? "")
+    .replace(/[\r\n]/g, " ")
+    .replace(/^[《「“\"']+|[》」”\"']+$/g, "")
+    .trim()
+    .slice(0, 40);
+  const rawFileName = String(parsed.fileName ?? "").trim();
+  if (!artifactTitle || !rawFileName) {
+    throw new Error("模型没有生成可用的作品名或文件名");
+  }
+  const fileName = normalizeNovelFileName(rawFileName).replace(
+    /\.(txt|markdown)$/i,
+    ".md",
+  );
+  return { conversationTitle, artifactTitle, fileName };
+}
+
+async function requestChatText(
+  config: ModelConfig,
+  requestId: string,
+  input: string,
+  systemPrompt: string,
+) {
+  const { Channel, invoke } = await import("@tauri-apps/api/core");
+  const onEvent = new Channel<ChatStreamEvent>();
+  let content = "";
+  let settle: () => void = () => undefined;
+  const settled = new Promise<void>((resolve) => {
+    settle = resolve;
+  });
+  onEvent.onmessage = (event) => {
+    if (event.event === "delta" && event.data) content += event.data;
+    if (event.event === "finished" || event.event === "cancelled") {
+      settle();
+    }
+  };
+  await invoke<void>("stream_chat_message", {
+    requestId,
+    provider: config.provider,
+    baseUrl: config.baseUrl,
+    apiKey: config.apiKey,
+    model: config.model,
+    apiPath: config.apiPath,
+    headersJson: config.headers,
+    input,
+    systemPrompt,
+    onEvent,
+  });
+  await settled;
+  if (!content.trim()) throw new Error("模型没有返回可用文本");
+  return content.trim();
+}
+
+async function planTurnMetadata(
+  config: ModelConfig,
+  requestId: string,
+  input: string,
+  needsArtifact: boolean,
+) {
+  const raw = await requestChatText(
+    config,
+    requestId,
+    `用户本轮请求：\n${input}`,
+    `你是 Agent 客户端的任务命名与文件规划器。只返回一行严格 JSON，不要 Markdown、代码围栏或解释。\n\nJSON 字段：\n- conversationTitle：6 到 16 个中文字符，准确概括用户目标，不使用日期、“新任务”、“用户请求”等空泛词。\n${
+      needsArtifact
+        ? "- artifactTitle：适合作品展示的简短中文小说名。\n- fileName：与作品名一致、适合本地保存的简短 Markdown 文件名，必须以 .md 结尾，不包含路径或非法字符。"
+        : "本轮不是文件命名任务，不要输出 artifactTitle 和 fileName。"
+    }\n\n示例：${
+      needsArtifact
+        ? '{"conversationTitle":"创作赛博悬疑短篇","artifactTitle":"雾港回声","fileName":"雾港回声.md"}'
+        : '{"conversationTitle":"拆解第一章分镜"}'
+    }`,
+  );
+  return parseTurnMetadataPlan(raw, needsArtifact);
+}
+
 function createThread(
   projectId: string | null = null,
   title = "新任务",
@@ -749,7 +828,11 @@ function normalizeWorkspace(value: unknown): WorkspaceState {
             ? project.updatedAt
             : Date.now(),
         resources: Array.isArray(project.resources)
-          ? project.resources
+          ? project.resources.map((resource) =>
+              resource.status === "generating"
+                ? { ...resource, status: "stopped" as const }
+                : resource,
+            )
           : [],
       };
     });
@@ -1727,6 +1810,8 @@ function App() {
       resource,
       baseContent,
       lastQueuedLength: 0,
+      lastPersistedLength: 0,
+      checkpointTimer: null,
       writeChain: Promise.resolve(resource),
     };
   };
@@ -1756,6 +1841,7 @@ function App() {
           status,
         };
         artifact.resource = resource;
+        artifact.lastPersistedLength = content.length;
         updateProject(artifact.context.project.id, (project) => ({
           ...project,
           updatedAt: Date.now(),
@@ -1769,6 +1855,64 @@ function App() {
         return resource;
       });
     return artifact.writeChain;
+  };
+
+  const showArtifactProgress = (
+    active: ActiveGeneration,
+    phase: "planning" | "writing" | "saving",
+  ) => {
+    const artifact = active.artifact;
+    setStreamingMessage({
+      id: active.messageId,
+      threadId: active.threadId,
+      content: "",
+      artifactStatus: {
+        phase,
+        fileName: artifact?.resource.name ?? "正在规划小说文件",
+        generatedCharacters: active.content.length,
+        persistedCharacters: artifact?.lastPersistedLength ?? 0,
+      },
+    });
+  };
+
+  const clearArtifactCheckpoint = (
+    artifact: ActiveTextArtifact | undefined,
+  ) => {
+    if (!artifact || artifact.checkpointTimer === null) return;
+    window.clearTimeout(artifact.checkpointTimer);
+    artifact.checkpointTimer = null;
+  };
+
+  const scheduleArtifactCheckpoint = (active: ActiveGeneration) => {
+    const artifact = active.artifact;
+    if (!artifact || artifact.checkpointTimer !== null) return;
+    artifact.checkpointTimer = window.setTimeout(() => {
+      artifact.checkpointTimer = null;
+      const current = activeGenerationRef.current;
+      if (
+        !current ||
+        current.requestId !== active.requestId ||
+        current.cancelled ||
+        current.content.length === artifact.lastQueuedLength
+      ) {
+        return;
+      }
+      void queueTextArtifactWrite(
+        artifact,
+        current.content,
+        "generating",
+      )
+        .then(() => {
+          const latest = activeGenerationRef.current;
+          if (
+            latest?.requestId === current.requestId &&
+            !latest.finalizing
+          ) {
+            showArtifactProgress(latest, "writing");
+          }
+        })
+        .catch(() => undefined);
+    }, 350);
   };
 
   const loadResourceContent = async (resource: ProjectResource) => {
@@ -1856,18 +2000,6 @@ function App() {
     const promptProject = writableContext?.project ?? selectedProject;
     const thread =
       writableContext?.thread ?? selectedThread ?? createThread();
-    let activeArtifact: ActiveTextArtifact | undefined;
-    if (artifactIntent && writableContext) {
-      try {
-        activeArtifact = await prepareTextArtifact(
-          writableContext,
-          artifactIntent,
-        );
-      } catch (error) {
-        setToast(`无法创建小说文件，已停止生成：${String(error)}`);
-        return;
-      }
-    }
     const userMessage = createMessage("user", input);
     const guideMessage =
       requiredKinds.length > 0
@@ -1888,29 +2020,14 @@ function App() {
       userMessage,
       ...(guideMessage ? [guideMessage] : []),
     ];
-    const conversationTitle =
-      thread.title === "新任务" ? input.slice(0, 24) : thread.title;
     setComposer("");
     setWorkspace((current) => ({
       ...current,
-      projects: current.projects.map((project) =>
-        project.id === thread.projectId && isManagedProject(project)
-          ? {
-              ...project,
-              name: conversationTitle,
-              updatedAt: Date.now(),
-            }
-          : project,
-      ),
       threads: current.threads.some((item) => item.id === threadId)
         ? current.threads.map((item) =>
             item.id === threadId
               ? {
                   ...item,
-                  title:
-                    item.title === "新任务"
-                      ? conversationTitle
-                      : item.title,
                   updatedAt: Date.now(),
                   messages: [
                     ...item.messages,
@@ -1922,7 +2039,6 @@ function App() {
         : [
             {
               ...thread,
-              title: conversationTitle,
               updatedAt: Date.now(),
               messages: messagesToAppend,
             },
@@ -1933,9 +2049,161 @@ function App() {
 
     if (guideMessage) return;
 
-    const requestId = createId();
     const messageId = createId();
-    activeGenerationRef.current = {
+    const metadataRequestId = createId();
+    const planningGeneration: ActiveGeneration = {
+      requestId: metadataRequestId,
+      threadId,
+      messageId,
+      content: "",
+      cancelled: false,
+    };
+    activeGenerationRef.current = planningGeneration;
+    setIsResponding(true);
+
+    let plannedIntent = artifactIntent;
+    let conversationTitle = thread.title;
+    const needsArtifactName = Boolean(
+      artifactIntent &&
+        (artifactIntent.operation === "create" ||
+          !promptProject?.resources.some(
+            (resource) => resource.category === "原著",
+          )),
+    );
+    const shouldPlanMetadata =
+      thread.title === "新任务" || needsArtifactName;
+
+    if (shouldPlanMetadata) {
+      setStreamingMessage({
+        id: messageId,
+        threadId,
+        content: artifactIntent
+          ? ""
+          : "正在理解任务并生成简短标题…",
+        ...(artifactIntent
+          ? {
+              artifactStatus: {
+                phase: "planning" as const,
+                fileName: "正在规划小说标题与文件名",
+                generatedCharacters: 0,
+                persistedCharacters: 0,
+              },
+            }
+          : {}),
+      });
+      try {
+        const plan = await planTurnMetadata(
+          config,
+          metadataRequestId,
+          input,
+          needsArtifactName,
+        );
+        if (
+          activeGenerationRef.current?.requestId !== metadataRequestId
+        ) {
+          return;
+        }
+        if (thread.title === "新任务") {
+          conversationTitle = plan.conversationTitle;
+        }
+        if (
+          needsArtifactName &&
+          artifactIntent &&
+          plan.artifactTitle &&
+          plan.fileName
+        ) {
+          plannedIntent = {
+            ...artifactIntent,
+            title: plan.artifactTitle,
+            fileName: plan.fileName,
+          };
+        }
+        setWorkspace((current) => ({
+          ...current,
+          projects: current.projects.map((project) =>
+            project.id === thread.projectId &&
+            isManagedProject(project)
+              ? {
+                  ...project,
+                  name: conversationTitle,
+                  updatedAt: Date.now(),
+                }
+              : project,
+          ),
+          threads: current.threads.map((item) =>
+            item.id === threadId && item.title === "新任务"
+              ? {
+                  ...item,
+                  title: conversationTitle,
+                  updatedAt: Date.now(),
+                }
+              : item,
+          ),
+        }));
+      } catch (error) {
+        if (
+          activeGenerationRef.current?.requestId !== metadataRequestId
+        ) {
+          return;
+        }
+        activeGenerationRef.current = null;
+        setStreamingMessage(null);
+        setIsResponding(false);
+        updateThread(threadId, (item) => ({
+          ...item,
+          updatedAt: Date.now(),
+          messages: [
+            ...item.messages,
+            createMessage(
+              "system",
+              `AI 无法完成任务与文件命名，已停止创建文件：${String(error)}`,
+            ),
+          ],
+        }));
+        return;
+      }
+    }
+
+    let activeArtifact: ActiveTextArtifact | undefined;
+    if (plannedIntent && writableContext) {
+      try {
+        activeArtifact = await prepareTextArtifact(
+          writableContext,
+          plannedIntent,
+        );
+      } catch (error) {
+        activeGenerationRef.current = null;
+        setStreamingMessage(null);
+        setIsResponding(false);
+        updateThread(threadId, (item) => ({
+          ...item,
+          messages: [
+            ...item.messages,
+            createMessage(
+              "system",
+              `无法创建小说文件，已停止生成：${String(error)}`,
+            ),
+          ],
+        }));
+        return;
+      }
+    }
+
+    if (
+      activeGenerationRef.current?.requestId !== metadataRequestId
+    ) {
+      if (activeArtifact) {
+        void queueTextArtifactWrite(
+          activeArtifact,
+          "",
+          "stopped",
+        );
+      }
+      return;
+    }
+
+    const requestId = createId();
+    const activeGeneration: ActiveGeneration = {
       requestId,
       threadId,
       messageId,
@@ -1943,12 +2211,12 @@ function App() {
       cancelled: false,
       artifact: activeArtifact,
     };
-    setStreamingMessage({
-      id: messageId,
-      threadId,
-      content: "",
-    });
-    setIsResponding(true);
+    activeGenerationRef.current = activeGeneration;
+    if (activeArtifact) {
+      showArtifactProgress(activeGeneration, "writing");
+    } else {
+      setStreamingMessage({ id: messageId, threadId, content: "" });
+    }
 
     try {
       const { Channel, invoke } = await import(
@@ -1976,21 +2244,15 @@ function App() {
         }
         if (event.event === "delta" && event.data) {
           active.content += event.data;
-          setStreamingMessage({
-            id: active.messageId,
-            threadId: active.threadId,
-            content: active.content,
-          });
-          if (
-            active.artifact &&
-            active.content.length - active.artifact.lastQueuedLength >=
-              6000
-          ) {
-            void queueTextArtifactWrite(
-              active.artifact,
-              active.content,
-              "generating",
-            ).catch(() => undefined);
+          if (active.artifact) {
+            showArtifactProgress(active, "writing");
+            scheduleArtifactCheckpoint(active);
+          } else {
+            setStreamingMessage({
+              id: active.messageId,
+              threadId: active.threadId,
+              content: active.content,
+            });
           }
         }
       };
@@ -2007,14 +2269,14 @@ function App() {
           input,
           selectedThread,
           promptProject,
-          artifactIntent,
+          plannedIntent,
           activeArtifact?.baseContent,
         ),
         systemPrompt: buildAgentSystemPrompt(
           modelConfigs,
           promptProject,
           accessMode,
-          activeArtifact?.intent ?? artifactIntent,
+          activeArtifact?.intent ?? plannedIntent,
         ),
         onEvent,
       });
@@ -2022,11 +2284,14 @@ function App() {
       await streamSettled;
       const completed = activeGenerationRef.current;
       if (!completed || completed.requestId !== requestId) return;
+      clearArtifactCheckpoint(completed.artifact);
       if (completed.content.trim()) {
         let completionMessage: Message;
         let saveFailureMessage: Message | null = null;
         if (completed.artifact) {
           try {
+            completed.finalizing = true;
+            showArtifactProgress(completed, "saving");
             const resource = await queueTextArtifactWrite(
               completed.artifact,
               completed.content,
@@ -2049,8 +2314,15 @@ function App() {
             setToast(`已保存「${resource.name}」并同步到资源栏`);
           } catch (saveError) {
             completionMessage = createMessage(
-              "assistant",
-              completed.content,
+              "system",
+              `小说正文已经生成，但无法写入文件 **${completed.artifact.resource.name}**。请检查目录权限后重试。`,
+              [
+                {
+                  type: "open-resource",
+                  resourceId: completed.artifact.resource.id,
+                  label: "检查小说文件",
+                },
+              ],
             );
             saveFailureMessage = createMessage(
               "system",
@@ -2090,6 +2362,7 @@ function App() {
     } catch (error) {
       const failed = activeGenerationRef.current;
       if (!failed || failed.requestId !== requestId) return;
+      clearArtifactCheckpoint(failed.artifact);
       activeGenerationRef.current = null;
       setStreamingMessage(null);
       setIsResponding(false);
@@ -2117,7 +2390,10 @@ function App() {
         } catch {
           failureMessages.push(
             {
-              ...createMessage("assistant", failed.content),
+              ...createMessage(
+                "system",
+                `生成已经中断，并且无法写入文件 ${failed.artifact.resource.name}。`,
+              ),
               status: "stopped",
             },
           );
@@ -2154,6 +2430,7 @@ function App() {
     }
 
     active.cancelled = true;
+    clearArtifactCheckpoint(active.artifact);
     activeGenerationRef.current = null;
     setStreamingMessage(null);
     setIsResponding(false);
@@ -2189,7 +2466,10 @@ function App() {
           setToast("已停止生成，现有小说内容已保存为草稿");
         } catch {
           stoppedMessage = {
-            ...createMessage("assistant", active.content),
+            ...createMessage(
+              "system",
+              `已停止生成，但无法继续写入文件 ${active.artifact.resource.name}。`,
+            ),
             status: "stopped",
           };
         }
@@ -3575,7 +3855,11 @@ function ChatView({
                 <span className="message-avatar">
                   <Clapperboard size={14} />
                 </span>
-                {activeStreamingMessage.content ? (
+                {activeStreamingMessage.artifactStatus ? (
+                  <ArtifactEditingStatus
+                    status={activeStreamingMessage.artifactStatus}
+                  />
+                ) : activeStreamingMessage.content ? (
                   <div className="message-body">
                     <div className="message-content">
                       <MarkdownMessage
@@ -3898,6 +4182,46 @@ function ChatView({
         </div>
       </footer>
     </section>
+  );
+}
+
+function ArtifactEditingStatus({
+  status,
+}: {
+  status: NonNullable<StreamingMessage["artifactStatus"]>;
+}) {
+  const isPlanning = status.phase === "planning";
+  const isSaving = status.phase === "saving";
+  return (
+    <div
+      className="artifact-editing-status"
+      data-phase={status.phase}
+      aria-live="polite"
+    >
+      <span className="artifact-editing-icon">
+        <FileText size={17} />
+        <i />
+      </span>
+      <span className="artifact-editing-copy">
+        <strong>
+          {isPlanning
+            ? "正在规划作品与文件名"
+            : isSaving
+              ? `正在完成写入：${status.fileName}`
+              : `正在编辑：${status.fileName}`}
+        </strong>
+        <small>
+          {isPlanning
+            ? "由对话模型生成任务标题、作品名和 Markdown 文件名"
+            : `已生成 ${status.generatedCharacters.toLocaleString()} 字 · 已写入 ${status.persistedCharacters.toLocaleString()} 字`}
+        </small>
+      </span>
+      <span className="artifact-editing-activity" aria-hidden="true">
+        <i />
+        <i />
+        <i />
+      </span>
+    </div>
   );
 }
 
@@ -5625,6 +5949,7 @@ function ResourcePreview({
   const [discardConfirmOpen, setDiscardConfirmOpen] =
     useState(false);
   const dirty = editable && content !== savedContent;
+  const agentWriting = resource.status === "generating";
 
   useEffect(() => {
     if (!editable) return;
@@ -5647,6 +5972,13 @@ function ResourcePreview({
       active = false;
     };
   }, [editable, resource.id, resource.path]);
+
+  useEffect(() => {
+    if (!editable || !agentWriting || dirty) return;
+    const liveContent = resource.preview ?? "";
+    setContent(liveContent);
+    setSavedContent(liveContent);
+  }, [agentWriting, dirty, editable, resource.preview]);
 
   const closeImmediately = () => {
     if (closing) return;
@@ -5691,7 +6023,11 @@ function ResourcePreview({
             <span>
               {resource.category}
               {resource.size ? ` · ${formatBytes(resource.size)}` : ""}
-              {editable ? " · 可编辑" : ""}
+              {editable
+                ? agentWriting
+                  ? " · Agent 正在编辑"
+                  : " · 可编辑"
+                : ""}
             </span>
           </div>
           <div className="resource-editor-actions">
@@ -5700,7 +6036,7 @@ function ResourcePreview({
                 type="button"
                 className="secondary-button compact-button"
                 onClick={() => void saveChanges()}
-                disabled={loading || saving || !dirty}
+                disabled={loading || saving || agentWriting || !dirty}
               >
                 {saving ? (
                   <RotateCcw size={13} className="spin" />
@@ -5731,12 +6067,19 @@ function ResourcePreview({
               <div className="resource-editor-shell">
                 <div className="resource-editor-meta">
                   <span>{content.length.toLocaleString()} 个字符</span>
-                  <span>{dirty ? "有未保存修改" : "已保存"}</span>
+                  <span>
+                    {agentWriting
+                      ? "正在同步 Agent 输出"
+                      : dirty
+                        ? "有未保存修改"
+                        : "已保存"}
+                  </span>
                 </div>
                 <textarea
                   className="resource-editor-textarea"
                   value={content}
                   onChange={(event) => setContent(event.target.value)}
+                  readOnly={agentWriting}
                   spellCheck={false}
                   aria-label={`编辑 ${resource.name}`}
                 />

@@ -103,6 +103,26 @@ fn parse_sse_line(line: &[u8], anthropic: bool) -> Option<String> {
     Some(delta.to_owned())
 }
 
+fn is_terminal_sse_line(line: &[u8]) -> bool {
+    let line = String::from_utf8_lossy(line);
+    let trimmed = line.trim();
+    if trimmed == "data: [DONE]" || trimmed == "event: message_stop" {
+        return true;
+    }
+
+    trimmed
+        .strip_prefix("data:")
+        .map(str::trim)
+        .and_then(|data| serde_json::from_str::<Value>(data).ok())
+        .and_then(|payload| {
+            payload
+                .get("type")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .is_some_and(|event_type| event_type == "message_stop")
+}
+
 fn emit_sse_line(line: &[u8], anthropic: bool, on_event: &Channel<ChatStreamEvent>) -> bool {
     let Some(delta) = parse_sse_line(line, anthropic) else {
         return false;
@@ -464,7 +484,7 @@ async fn stream_chat_message(
     let mut emitted_delta = false;
     let mut cancelled = false;
 
-    loop {
+    'response_stream: loop {
         let next_chunk = tokio::select! {
             _ = cancel_rx.changed() => {
                 if *cancel_rx.borrow() {
@@ -493,6 +513,9 @@ async fn stream_chat_message(
 
         while let Some(newline) = line_buffer.iter().position(|byte| *byte == b'\n') {
             let line: Vec<u8> = line_buffer.drain(..=newline).collect();
+            if is_terminal_sse_line(&line) {
+                break 'response_stream;
+            }
             emitted_delta |= emit_sse_line(&line, anthropic, &on_event);
         }
     }
@@ -702,7 +725,10 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::{complete_response_text, parse_sse_line, uses_kie_market, KIE_SEEDREAM_MODELS};
+    use super::{
+        complete_response_text, is_terminal_sse_line, parse_sse_line, uses_kie_market,
+        KIE_SEEDREAM_MODELS,
+    };
     use serde_json::json;
 
     #[test]
@@ -730,6 +756,16 @@ mod tests {
     fn ignores_sse_control_lines() {
         assert_eq!(parse_sse_line(b"event: message_start", true), None);
         assert_eq!(parse_sse_line(b"data: [DONE]", false), None);
+    }
+
+    #[test]
+    fn recognizes_stream_terminal_events() {
+        assert!(is_terminal_sse_line(b"data: [DONE]\n"));
+        assert!(is_terminal_sse_line(b"event: message_stop\r\n"));
+        assert!(is_terminal_sse_line(br#"data: {"type":"message_stop"}"#));
+        assert!(!is_terminal_sse_line(
+            br#"data: {"choices":[{"delta":{"content":"x"}}]}"#
+        ));
     }
 
     #[test]

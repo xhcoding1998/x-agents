@@ -1215,6 +1215,110 @@ button:focus-visible {
   animation: stream-cursor 900ms steps(1) infinite;
 }
 
+.artifact-editing-status {
+  width: min(100%, 470px);
+  min-height: 66px;
+  display: grid;
+  grid-template-columns: 36px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 11px;
+  padding: 11px 12px;
+  border: 1px solid #d9e2ec;
+  border-radius: 13px;
+  background: linear-gradient(135deg, #fbfdff, #f5f8fc);
+  box-shadow: 0 5px 18px rgb(34 51 70 / 7%);
+  animation: content-switch var(--motion-base) ease-out both;
+}
+
+.artifact-editing-icon {
+  width: 36px;
+  height: 36px;
+  position: relative;
+  display: grid;
+  place-items: center;
+  border-radius: 10px;
+  color: #2863bd;
+  background: #e7f0ff;
+}
+
+.artifact-editing-icon > i {
+  width: 8px;
+  height: 8px;
+  position: absolute;
+  right: -1px;
+  bottom: -1px;
+  border: 2px solid #fff;
+  border-radius: 50%;
+  background: #3b82f6;
+  box-sizing: content-box;
+  animation: artifact-status-pulse 1.4s ease-in-out infinite;
+}
+
+.artifact-editing-status[data-phase="saving"]
+  .artifact-editing-icon
+  > i {
+  background: #2f9a73;
+}
+
+.artifact-editing-copy {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.artifact-editing-copy strong {
+  overflow: hidden;
+  color: #33404b;
+  font-size: 13px;
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.artifact-editing-copy small {
+  overflow: hidden;
+  color: #7e8b96;
+  font-size: 11.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.artifact-editing-activity {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  padding: 0 3px;
+}
+
+.artifact-editing-activity i {
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: #6f87aa;
+  animation: typing 1s ease-in-out infinite;
+}
+
+.artifact-editing-activity i:nth-child(2) {
+  animation-delay: 120ms;
+}
+
+.artifact-editing-activity i:nth-child(3) {
+  animation-delay: 240ms;
+}
+
+@keyframes artifact-status-pulse {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 rgb(59 130 246 / 0%);
+    transform: scale(0.92);
+  }
+  50% {
+    box-shadow: 0 0 0 4px rgb(59 130 246 / 14%);
+    transform: scale(1);
+  }
+}
+
 .chat-scroll-to-bottom {
   width: 34px;
   height: 34px;
