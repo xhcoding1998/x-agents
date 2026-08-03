@@ -62,6 +62,20 @@ fn safe_source_relative_path(value: &str) -> Result<PathBuf, String> {
     }
 }
 
+fn safe_project_id(value: &str) -> Result<String, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty()
+        || trimmed == "."
+        || trimmed == ".."
+        || !trimmed.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+        })
+    {
+        return Err("项目 ID 无效".into());
+    }
+    Ok(trimmed.to_string())
+}
+
 fn uses_anthropic_messages(provider: &str) -> bool {
     provider.to_ascii_lowercase().contains("anthropic")
         || provider.to_ascii_lowercase().contains("claude")
@@ -597,13 +611,7 @@ async fn create_managed_output(
     app: tauri::AppHandle,
     project_id: String,
 ) -> Result<String, String> {
-    let safe_project_id: String = project_id
-        .chars()
-        .filter(|character| character.is_ascii_alphanumeric() || *character == '-')
-        .collect();
-    if safe_project_id.is_empty() {
-        return Err("项目 ID 无效".into());
-    }
+    let safe_project_id = safe_project_id(&project_id)?;
 
     let output_dir = app
         .path()
@@ -615,6 +623,31 @@ async fn create_managed_output(
         .map_err(|error| format!("无法创建应用输出目录：{error}"))?;
 
     Ok(output_dir.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
+async fn delete_managed_project(app: tauri::AppHandle, project_id: String) -> Result<bool, String> {
+    let safe_project_id = safe_project_id(&project_id)?;
+
+    let output_root = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("无法获取应用数据目录：{error}"))?
+        .join("outputs");
+    let target = output_root.join(&safe_project_id);
+    if !target.exists() {
+        return Ok(false);
+    }
+    let canonical_root = std::fs::canonicalize(&output_root)
+        .map_err(|error| format!("无法访问应用输出目录：{error}"))?;
+    let canonical_target = std::fs::canonicalize(&target)
+        .map_err(|error| format!("无法访问待删除项目目录：{error}"))?;
+    if canonical_target == canonical_root || !canonical_target.starts_with(&canonical_root) {
+        return Err("拒绝删除应用输出目录之外的内容".into());
+    }
+    std::fs::remove_dir_all(&canonical_target)
+        .map_err(|error| format!("无法删除应用托管项目：{error}"))?;
+    Ok(true)
 }
 
 #[tauri::command]
@@ -651,13 +684,7 @@ async fn save_project_source(
     file_name: String,
     content: String,
 ) -> Result<String, String> {
-    let safe_project_id: String = project_id
-        .chars()
-        .filter(|character| character.is_ascii_alphanumeric() || *character == '-')
-        .collect();
-    if safe_project_id.is_empty() {
-        return Err("项目 ID 无效".into());
-    }
+    let safe_project_id = safe_project_id(&project_id)?;
 
     let safe_relative_path = safe_source_relative_path(&file_name)?;
 
@@ -739,6 +766,7 @@ pub fn run() {
             stream_chat_message,
             cancel_chat_generation,
             create_managed_output,
+            delete_managed_project,
             open_project_folder,
             save_project_source,
             read_project_source
@@ -750,8 +778,8 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        complete_response_text, is_terminal_sse_line, parse_sse_line, safe_source_relative_path,
-        uses_kie_market, KIE_SEEDREAM_MODELS,
+        complete_response_text, is_terminal_sse_line, parse_sse_line, safe_project_id,
+        safe_source_relative_path, uses_kie_market, KIE_SEEDREAM_MODELS,
     };
     use serde_json::json;
     use std::path::PathBuf;
@@ -801,6 +829,17 @@ mod tests {
         );
         assert!(safe_source_relative_path("../secrets.md").is_err());
         assert!(safe_source_relative_path("/absolute.md").is_err());
+    }
+
+    #[test]
+    fn accepts_only_single_safe_project_ids() {
+        assert_eq!(
+            safe_project_id("project-01.alpha").unwrap(),
+            "project-01.alpha"
+        );
+        assert!(safe_project_id("../project-01").is_err());
+        assert!(safe_project_id("project/01").is_err());
+        assert!(safe_project_id("..").is_err());
     }
 
     #[test]

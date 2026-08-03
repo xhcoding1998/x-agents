@@ -40,6 +40,7 @@ import {
   Sparkles,
   Square,
   SquarePen,
+  Trash2,
   Video,
   X,
 } from "lucide-react";
@@ -172,6 +173,10 @@ type ManagedOutputApproval = {
   action: string;
   resolve: (approved: boolean) => void;
 };
+
+type WorkspaceDeleteTarget =
+  | { kind: "thread"; threadId: string }
+  | { kind: "project"; projectId: string };
 
 type Thread = {
   id: string;
@@ -460,7 +465,10 @@ const resourceCategoryOrder: ResourceCategory[] = [
 ];
 
 function createId() {
-  return globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random()}`;
+  return (
+    globalThis.crypto?.randomUUID?.() ??
+    `${Date.now()}-${Math.random().toString(36).slice(2)}`
+  );
 }
 
 function createMessage(
@@ -707,7 +715,7 @@ function buildAgentSystemPrompt(
 - 生图模型：${capability("image")}
 - 视频模型：${capability("video")}
 - 权限模式：${accessModeLabel(accessMode)}
-- 当前项目：${project?.name ?? "未绑定"}
+- 当前资源上下文：${project ? (isManagedProject(project) ? "当前对话的应用托管资源" : `外部项目文件夹 ${project.name}`) : "未绑定"}
 - 已有资源：${resourceSummary}
 
 必须遵循的制作顺序：
@@ -938,7 +946,9 @@ function folderName(path: string) {
 function isManagedProject(
   project: Pick<Project, "managed" | "rootPath">,
 ) {
-  return project.managed === true || /[\\/]outputs[\\/]/i.test(project.rootPath);
+  if (project.managed === true) return true;
+  if (project.managed === false) return false;
+  return /[\\/]outputs[\\/]/i.test(project.rootPath);
 }
 
 function createProject(rootPath: string): Project {
@@ -1220,6 +1230,10 @@ function App() {
     useState<NovelCreationMode | null>(null);
   const [managedOutputApproval, setManagedOutputApproval] =
     useState<ManagedOutputApproval | null>(null);
+  const [deleteTarget, setDeleteTarget] =
+    useState<WorkspaceDeleteTarget | null>(null);
+  const [deleteBusy, setDeleteBusy] = useState(false);
+  const [deleteClosing, setDeleteClosing] = useState(false);
   const [toast, setToast] = useState("");
   const [testState, setTestState] = useState<{
     loading: boolean;
@@ -1724,7 +1738,11 @@ function App() {
     setSelectedResourceId(resource.id);
     setRightTab("files");
     setRightOpen(true);
-    setToast("原著已导入当前项目");
+    setToast(
+      isManagedProject(context.project)
+        ? "原著已导入当前对话资源"
+        : "原著已导入当前项目",
+    );
   };
 
   const openNovelCreator = async (mode: NovelCreationMode) => {
@@ -3002,6 +3020,140 @@ function App() {
       .catch(() => undefined);
   };
 
+  const cancelGenerationForThreads = async (threadIds: Set<string>) => {
+    const active = activeGenerationRef.current;
+    if (!active || !threadIds.has(active.threadId)) return;
+    active.cancelled = true;
+    clearArtifactCheckpoint(active.artifact);
+    activeGenerationRef.current = null;
+    setStreamingMessage(null);
+    setIsResponding(false);
+    try {
+      const { invoke } = await import("@tauri-apps/api/core");
+      await invoke<boolean>("cancel_chat_generation", {
+        requestId: active.requestId,
+      });
+    } catch {
+      // The local state is already stopped even if the provider finished first.
+    }
+    if (active.artifact) {
+      await active.artifact.writeChain.catch(() => active.artifact?.resource);
+    }
+  };
+
+  const confirmWorkspaceDeletion = async () => {
+    if (!deleteTarget || deleteBusy) return;
+    setDeleteBusy(true);
+    try {
+      if (deleteTarget.kind === "thread") {
+        const removedThread = workspace.threads.find(
+          (thread) => thread.id === deleteTarget.threadId,
+        );
+        if (!removedThread) {
+          setDeleteTarget(null);
+          return;
+        }
+        const threadProject = workspace.projects.find(
+          (project) => project.id === removedThread.projectId,
+        );
+        const removeManagedContext = Boolean(
+          threadProject &&
+            isManagedProject(threadProject) &&
+            !workspace.threads.some(
+              (thread) =>
+                thread.id !== removedThread.id &&
+                thread.projectId === threadProject.id,
+            ),
+        );
+        await cancelGenerationForThreads(new Set([removedThread.id]));
+        if (removeManagedContext && threadProject) {
+          const { invoke } = await import("@tauri-apps/api/core");
+          await invoke<boolean>("delete_managed_project", {
+            projectId: threadProject.id,
+          });
+        }
+        const remainingThreads = workspace.threads
+          .filter((thread) => thread.id !== removedThread.id)
+          .sort((left, right) => right.updatedAt - left.updatedAt);
+        setWorkspace((current) => ({
+          projects:
+            removeManagedContext && threadProject
+              ? current.projects.filter(
+                  (project) => project.id !== threadProject.id,
+                )
+              : current.projects,
+          threads: current.threads.filter(
+            (thread) => thread.id !== removedThread.id,
+          ),
+        }));
+        if (selectedThreadId === removedThread.id) {
+          setSelectedThreadId(remainingThreads[0]?.id ?? "");
+          setSelectedResourceId("");
+          setResourcePreviewOpen(false);
+        }
+        setToast(
+          removeManagedContext
+            ? `已删除对话「${removedThread.title}」及其托管文件`
+            : `已删除对话「${removedThread.title}」`,
+        );
+      } else {
+        const removedProject = workspace.projects.find(
+          (project) => project.id === deleteTarget.projectId,
+        );
+        if (!removedProject) {
+          setDeleteTarget(null);
+          return;
+        }
+        const removedThreadIds = new Set(
+          workspace.threads
+            .filter((thread) => thread.projectId === removedProject.id)
+            .map((thread) => thread.id),
+        );
+        await cancelGenerationForThreads(removedThreadIds);
+        if (isManagedProject(removedProject)) {
+          const { invoke } = await import("@tauri-apps/api/core");
+          await invoke<boolean>("delete_managed_project", {
+            projectId: removedProject.id,
+          });
+        }
+        const remainingThreads = workspace.threads
+          .filter((thread) => !removedThreadIds.has(thread.id))
+          .sort((left, right) => right.updatedAt - left.updatedAt);
+        setWorkspace((current) => ({
+          projects: current.projects.filter(
+            (project) => project.id !== removedProject.id,
+          ),
+          threads: current.threads.filter(
+            (thread) => !removedThreadIds.has(thread.id),
+          ),
+        }));
+        if (
+          selectedThreadId &&
+          removedThreadIds.has(selectedThreadId)
+        ) {
+          setSelectedThreadId(remainingThreads[0]?.id ?? "");
+          setSelectedResourceId("");
+          setResourcePreviewOpen(false);
+        }
+        setToast(
+          isManagedProject(removedProject)
+            ? `已删除项目「${removedProject.name}」及其托管文件`
+            : `已从客户端移除项目「${removedProject.name}」，外部文件未删除`,
+        );
+      }
+      setDeleteClosing(true);
+      await new Promise<void>((resolve) => {
+        window.setTimeout(resolve, 160);
+      });
+      setDeleteTarget(null);
+      setDeleteClosing(false);
+    } catch (error) {
+      setToast(`删除失败：${String(error)}`);
+    } finally {
+      setDeleteBusy(false);
+    }
+  };
+
   useEffect(() => {
     if (isResponding || !pendingGuidanceRef.current) return;
     pendingGuidanceRef.current = false;
@@ -3267,6 +3419,12 @@ function App() {
             )
           }
           onToggleThreadPinned={toggleThreadPinned}
+          onRequestDeleteThread={(threadId) =>
+            setDeleteTarget({ kind: "thread", threadId })
+          }
+          onRequestDeleteProject={(projectId) =>
+            setDeleteTarget({ kind: "project", projectId })
+          }
           onSelectThread={(threadId) => {
             setSelectedThreadId(threadId);
             setSelectedResourceId("");
@@ -3331,7 +3489,6 @@ function App() {
 
         <RightSidebar
           project={selectedProject}
-          thread={selectedThread}
           activeTab={rightTab}
           selectedResourceId={selectedResourceId}
           isOpen={rightOpen}
@@ -3391,7 +3548,11 @@ function App() {
           modelCatalogs={modelCatalogs}
           activeKind={activeModelKind}
           testState={testState}
-          projectCount={workspace.projects.length}
+          projectCount={
+            workspace.projects.filter(
+              (project) => !isManagedProject(project),
+            ).length
+          }
           threadCount={workspace.threads.length}
           onClose={() => setSettingsDialogOpen(false)}
           onChangeKind={setActiveModelKind}
@@ -3405,7 +3566,11 @@ function App() {
       {novelCreationMode && selectedProject && (
         <NovelCreatorDialog
           mode={novelCreationMode}
-          projectName={selectedProject.name}
+          projectName={
+            isManagedProject(selectedProject)
+              ? "当前对话"
+              : selectedProject.name
+          }
           onClose={() => {
             cancelNovelGeneration();
             setNovelCreationMode(null);
@@ -3433,6 +3598,25 @@ function App() {
         />
       )}
 
+      {deleteTarget && (
+        <WorkspaceDeleteDialog
+          target={deleteTarget}
+          projects={workspace.projects}
+          threads={workspace.threads}
+          busy={deleteBusy}
+          closing={deleteClosing}
+          onCancel={() => {
+            if (deleteBusy || deleteClosing) return;
+            setDeleteClosing(true);
+            window.setTimeout(() => {
+              setDeleteTarget(null);
+              setDeleteClosing(false);
+            }, 180);
+          }}
+          onConfirm={() => void confirmWorkspaceDeletion()}
+        />
+      )}
+
       {toast && <StatusToast key={toast} message={toast} />}
     </div>
   );
@@ -3451,6 +3635,8 @@ function LeftSidebar({
   onResetWidth,
   onAdjustWidth,
   onToggleThreadPinned,
+  onRequestDeleteThread,
+  onRequestDeleteProject,
   onSelectThread,
 }: {
   projects: Project[];
@@ -3465,6 +3651,8 @@ function LeftSidebar({
   onResetWidth: () => void;
   onAdjustWidth: (delta: number) => void;
   onToggleThreadPinned: (threadId: string) => void;
+  onRequestDeleteThread: (threadId: string) => void;
+  onRequestDeleteProject: (projectId: string) => void;
   onSelectThread: (threadId: string) => void;
 }) {
   const [preferences, setPreferences] =
@@ -3476,6 +3664,11 @@ function LeftSidebar({
   const [workspaceMenuOpen, setWorkspaceMenuOpen] = useState(false);
   const [threadMenu, setThreadMenu] = useState<{
     threadId: string;
+    left: number;
+    top: number;
+  } | null>(null);
+  const [projectMenu, setProjectMenu] = useState<{
+    projectId: string;
     left: number;
     top: number;
   } | null>(null);
@@ -3494,20 +3687,29 @@ function LeftSidebar({
     );
   const recentThreads = threads
     .filter(
-      (thread) =>
-        !thread.projectId && thread.pinnedAt === null,
+      (thread) => {
+        const project = projects.find(
+          (item) => item.id === thread.projectId,
+        );
+        return (
+          thread.pinnedAt === null &&
+          (!project || isManagedProject(project))
+        );
+      },
     )
     .sort((left, right) => right.updatedAt - left.updatedAt);
-  const sortedProjects = [...projects].sort((left, right) => {
-    const activity = (projectId: string) =>
-      threads
-        .filter((thread) => thread.projectId === projectId)
-        .reduce(
-          (latest, thread) => Math.max(latest, thread.updatedAt),
-          0,
-        );
-    return activity(right.id) - activity(left.id);
-  });
+  const sortedProjects = projects
+    .filter((project) => !isManagedProject(project))
+    .sort((left, right) => {
+      const activity = (projectId: string) =>
+        threads
+          .filter((thread) => thread.projectId === projectId)
+          .reduce(
+            (latest, thread) => Math.max(latest, thread.updatedAt),
+            0,
+          );
+      return activity(right.id) - activity(left.id);
+    });
 
   const isSectionCollapsed = (section: SidebarSectionKey) =>
     preferences.collapsedSections.includes(section);
@@ -3607,6 +3809,28 @@ function LeftSidebar({
   }, [threadMenu]);
 
   useEffect(() => {
+    if (!projectMenu) return;
+    const closeMenu = (event: PointerEvent) => {
+      if (
+        !(event.target as HTMLElement).closest(
+          "[data-sidebar-project-menu]",
+        )
+      ) {
+        setProjectMenu(null);
+      }
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setProjectMenu(null);
+    };
+    window.addEventListener("pointerdown", closeMenu);
+    window.addEventListener("keydown", closeOnEscape);
+    return () => {
+      window.removeEventListener("pointerdown", closeMenu);
+      window.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [projectMenu]);
+
+  useEffect(() => {
     if (!workspaceMenuOpen) return;
     const closeMenu = (event: PointerEvent) => {
       if (
@@ -3643,11 +3867,35 @@ function LeftSidebar({
   ) => {
     event.stopPropagation();
     setWorkspaceMenuOpen(false);
+    setProjectMenu(null);
     const rect = event.currentTarget.getBoundingClientRect();
     const menuWidth = 178;
-    const menuHeight = 52;
+    const menuHeight = 96;
     setThreadMenu({
       threadId,
+      left: Math.max(
+        8,
+        Math.min(window.innerWidth - menuWidth - 8, rect.right - menuWidth),
+      ),
+      top:
+        rect.bottom + menuHeight + 8 > window.innerHeight
+          ? rect.top - menuHeight - 4
+          : rect.bottom + 4,
+    });
+  };
+
+  const openProjectMenu = (
+    event: ReactMouseEvent<HTMLButtonElement>,
+    projectId: string,
+  ) => {
+    event.stopPropagation();
+    setWorkspaceMenuOpen(false);
+    setThreadMenu(null);
+    const rect = event.currentTarget.getBoundingClientRect();
+    const menuWidth = 192;
+    const menuHeight = 52;
+    setProjectMenu({
+      projectId,
       left: Math.max(
         8,
         Math.min(window.innerWidth - menuWidth - 8, rect.right - menuWidth),
@@ -3862,10 +4110,7 @@ function LeftSidebar({
                       (left, right) =>
                         right.updatedAt - left.updatedAt,
                     );
-                  const projectTitle =
-                    isManagedProject(project) && projectThreads[0]
-                      ? projectThreads[0].title
-                      : project.name;
+                  const projectTitle = project.name;
                   const selected =
                     selectedThread?.projectId === project.id;
                   const collapsed =
@@ -3874,19 +4119,33 @@ function LeftSidebar({
                     );
                   return (
                     <div className="project-block" key={project.id}>
-                      <button
-                        className={`project-row ${
-                          selected ? "current" : ""
-                        }`}
-                        onClick={() => toggleProject(project.id)}
-                      >
-                        <Folder size={15} />
-                        <span title={project.rootPath}>{projectTitle}</span>
-                        <ChevronRight
-                          size={13}
-                          className={collapsed ? "" : "open"}
-                        />
-                      </button>
+                      <div className="project-entry">
+                        <button
+                          className={`project-row ${
+                            selected ? "current" : ""
+                          }`}
+                          onClick={() => toggleProject(project.id)}
+                        >
+                          <Folder size={15} />
+                          <span title={project.rootPath}>{projectTitle}</span>
+                          <ChevronRight
+                            size={13}
+                            className={collapsed ? "" : "open"}
+                          />
+                        </button>
+                        <button
+                          type="button"
+                          className="project-row-action"
+                          data-sidebar-project-menu
+                          onClick={(event) =>
+                            openProjectMenu(event, project.id)
+                          }
+                          aria-label={`${projectTitle} 的更多操作`}
+                          title="项目操作"
+                        >
+                          <MoreHorizontal size={16} />
+                        </button>
+                      </div>
                       <div
                         className={`project-thread-content ${
                           collapsed ? "collapsed" : ""
@@ -4067,6 +4326,41 @@ function LeftSidebar({
                 : "置顶任务"}
             </span>
           </button>
+          <button
+            className="danger-menu-item"
+            role="menuitem"
+            onClick={() => {
+              onRequestDeleteThread(threadMenu.threadId);
+              setThreadMenu(null);
+            }}
+          >
+            <Trash2 size={15} />
+            <span>删除对话</span>
+          </button>
+        </div>
+      )}
+
+      {projectMenu && (
+        <div
+          className="sidebar-context-menu project-context-menu ui-popover"
+          data-sidebar-project-menu
+          style={{
+            left: projectMenu.left,
+            top: projectMenu.top,
+          }}
+          role="menu"
+        >
+          <button
+            className="danger-menu-item"
+            role="menuitem"
+            onClick={() => {
+              onRequestDeleteProject(projectMenu.projectId);
+              setProjectMenu(null);
+            }}
+          >
+            <Trash2 size={15} />
+            <span>删除项目</span>
+          </button>
         </div>
       )}
     </aside>
@@ -4244,7 +4538,13 @@ function ChatView({
       <header className="center-header">
         <div className="center-title">
           <strong>{thread?.title ?? "新任务"}</strong>
-          <span>{project?.name ?? "未绑定项目文件夹"}</span>
+          <span>
+            {project
+              ? isManagedProject(project)
+                ? "对话资源 · 应用托管"
+                : project.name
+              : "未绑定项目文件夹"}
+          </span>
         </div>
         <button
           className="icon-button"
@@ -4416,7 +4716,9 @@ function ChatView({
                 )}
                 <span>
                   {project
-                    ? thread?.title ?? project.name
+                    ? isManagedProject(project)
+                      ? "对话资源"
+                      : project.name
                     : "未绑定项目文件夹"}
                 </span>
               </div>
@@ -4452,7 +4754,11 @@ function ChatView({
                     )}
                   </span>
                   <div>
-                    <strong>{thread?.title ?? project.name}</strong>
+                    <strong>
+                      {isManagedProject(project)
+                        ? "当前对话资源"
+                        : project.name}
+                    </strong>
                     <span>
                       {isManagedProject(project)
                         ? "应用托管输出目录"
@@ -4758,7 +5064,9 @@ function EmptyTask({
       <h1>{project ? "这轮任务要完成什么？" : "我们开始做什么？"}</h1>
       <p>
         {project
-          ? `描述本轮任务，Agent 将在「${project.name}」中读取和生成文件。`
+          ? isManagedProject(project)
+            ? "描述本轮任务，Agent 会直接在当前对话上下文中生成文件与物料。"
+            : `描述本轮任务，Agent 将在「${project.name}」中读取和生成文件。`
           : accessMode === "full"
             ? "输入小说、故事构想或制作目标，首次保存时会自动创建应用输出目录。"
             : "输入小说、故事构想或制作目标，Agent 会从当前对话开始执行。"}
@@ -5637,7 +5945,6 @@ function ModelTab({
 
 function RightSidebar({
   project,
-  thread,
   activeTab,
   selectedResourceId,
   isOpen,
@@ -5648,7 +5955,6 @@ function RightSidebar({
   onResetWidth,
 }: {
   project: Project | null;
-  thread: Thread | null;
   activeTab: "files" | "tasks";
   selectedResourceId: string;
   isOpen: boolean;
@@ -5698,7 +6004,7 @@ function RightSidebar({
           <span title={project?.rootPath}>
             {project
               ? isManagedProject(project)
-                ? thread?.title ?? project.name
+                ? "当前对话资源"
                 : project.name
               : "当前任务未绑定文件夹"}
           </span>
@@ -5722,7 +6028,7 @@ function RightSidebar({
 
       <div className="right-search">
         <Search size={14} />
-        <input placeholder="搜索项目资源" />
+        <input placeholder="搜索文件与资源" />
         <LayoutGrid size={14} />
       </div>
 
@@ -5732,7 +6038,7 @@ function RightSidebar({
             <RightEmpty
               icon={<Clock3 size={20} />}
               title="暂无任务"
-              description="生成任务会按项目显示"
+              description="生成任务会与当前对话和资源保持联动"
             />
           ) : !project ? (
             <RightEmpty
@@ -5743,8 +6049,16 @@ function RightSidebar({
           ) : groups.length === 0 ? (
             <RightEmpty
               icon={<FileText size={20} />}
-              title="项目中还没有文件"
-              description="导入小说后，原始文件会显示在这里"
+              title={
+                isManagedProject(project)
+                  ? "当前对话还没有文件"
+                  : "项目中还没有文件"
+              }
+              description={
+                isManagedProject(project)
+                  ? "Agent 生成或导入的文件会直接显示在当前对话资源中"
+                  : "导入小说后，原始文件会显示在这里"
+              }
             />
           ) : (
             <AnimatedList className="resource-tree">
@@ -5924,6 +6238,106 @@ function RightEmpty({
   );
 }
 
+function WorkspaceDeleteDialog({
+  target,
+  projects,
+  threads,
+  busy,
+  closing,
+  onCancel,
+  onConfirm,
+}: {
+  target: WorkspaceDeleteTarget;
+  projects: Project[];
+  threads: Thread[];
+  busy: boolean;
+  closing: boolean;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  const thread =
+    target.kind === "thread"
+      ? threads.find((item) => item.id === target.threadId)
+      : null;
+  const project =
+    target.kind === "project"
+      ? projects.find((item) => item.id === target.projectId)
+      : null;
+  const threadProject = thread
+    ? projects.find((item) => item.id === thread.projectId)
+    : null;
+  const threadRemovesManagedContext = Boolean(
+    threadProject &&
+      isManagedProject(threadProject) &&
+      threads.filter((item) => item.projectId === threadProject.id).length <= 1,
+  );
+  const projectThreads = project
+    ? threads.filter((item) => item.projectId === project.id)
+    : [];
+  const managed = Boolean(project && isManagedProject(project));
+  const title =
+    target.kind === "thread"
+      ? `删除对话“${thread?.title ?? "未命名任务"}”？`
+      : `删除项目“${project?.name ?? "未命名项目"}”？`;
+  const description =
+    target.kind === "thread"
+      ? threadRemovesManagedContext
+        ? `该对话、${threadProject?.resources.length ?? 0} 个资源记录以及对话专属的应用托管文件都会被永久删除。`
+        : "该对话的消息记录会从本机移除。已绑定的外部项目和磁盘文件不会被删除。"
+      : managed
+        ? `项目中的 ${projectThreads.length} 个对话、${project?.resources.length ?? 0} 个资源记录以及应用托管的输出文件都会被永久删除。`
+        : `项目及其中 ${projectThreads.length} 个对话会从客户端移除，但绑定文件夹中的原始文件不会被删除。`;
+
+  return createPortal(
+    <div
+      className={`modal-backdrop workspace-delete-backdrop ${
+        closing ? "closing" : ""
+      }`}
+      onMouseDown={busy ? undefined : onCancel}
+    >
+      <section
+        className="workspace-delete-dialog ui-dialog"
+        role="alertdialog"
+        aria-modal="true"
+        aria-labelledby="workspace-delete-title"
+        aria-describedby="workspace-delete-description"
+        onMouseDown={(event) => event.stopPropagation()}
+      >
+        <span className="workspace-delete-icon">
+          <Trash2 size={20} />
+        </span>
+        <div className="workspace-delete-copy">
+          <h2 id="workspace-delete-title">{title}</h2>
+          <p id="workspace-delete-description">{description}</p>
+          {target.kind === "project" && !managed && project?.rootPath && (
+            <code>{project.rootPath}</code>
+          )}
+        </div>
+        <footer>
+          <button
+            type="button"
+            className="secondary-button"
+            onClick={onCancel}
+            disabled={busy}
+          >
+            取消
+          </button>
+          <button
+            type="button"
+            className="danger-button"
+            onClick={onConfirm}
+            disabled={busy}
+          >
+            {busy ? <RotateCcw size={14} className="spin" /> : <Trash2 size={14} />}
+            {busy ? "正在删除" : target.kind === "thread" ? "删除对话" : "删除项目"}
+          </button>
+        </footer>
+      </section>
+    </div>,
+    document.body,
+  );
+}
+
 function ManagedOutputApprovalDialog({
   action,
   onCancel,
@@ -6023,26 +6437,35 @@ function WorkspaceSearchDialog({
 
   const allItems = useMemo<WorkspaceSearchItem[]>(
     () => {
-      const projectItems = projects.flatMap((project) => [
-          {
-            id: `project-${project.id}`,
-            kind: "project" as const,
-            title: project.name,
-            meta: `${threads.filter((thread) => thread.projectId === project.id).length} 个任务 · ${project.resources.length} 个文件`,
-            timestamp: project.updatedAt,
-            projectId: project.id,
-          },
-          ...project.resources.map((resource) => ({
+      const projectItems = projects.flatMap((project) => {
+        const projectThreads = threads.filter(
+          (thread) => thread.projectId === project.id,
+        );
+        const resourceItems = project.resources.map((resource) => ({
             id: `resource-${resource.id}`,
             kind: "resource" as const,
             title: resource.name,
-            meta: `${project.name} · ${resource.category}`,
+            meta: isManagedProject(project)
+              ? `${projectThreads[0]?.title ?? "当前对话"} · ${resource.category}`
+              : `${project.name} · ${resource.category}`,
             timestamp: resource.createdAt,
             projectId: project.id,
             resourceId: resource.id,
             category: resource.category,
-          })),
-        ]);
+          }));
+        if (isManagedProject(project)) return resourceItems;
+        return [
+          {
+            id: `project-${project.id}`,
+            kind: "project" as const,
+            title: project.name,
+            meta: `${projectThreads.length} 个任务 · ${project.resources.length} 个文件`,
+            timestamp: project.updatedAt,
+            projectId: project.id,
+          },
+          ...resourceItems,
+        ];
+      });
       const threadItems = threads.map((thread) => {
         const project = projects.find(
           (item) => item.id === thread.projectId,
@@ -6051,7 +6474,11 @@ function WorkspaceSearchDialog({
           id: `thread-${thread.id}`,
           kind: "thread" as const,
           title: thread.title,
-          meta: project?.name ?? "未绑定项目文件夹",
+          meta: project
+            ? isManagedProject(project)
+              ? "对话资源 · 应用托管"
+              : project.name
+            : "未绑定项目文件夹",
           timestamp: thread.updatedAt,
           projectId: project?.id,
           threadId: thread.id,

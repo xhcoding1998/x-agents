@@ -576,6 +576,11 @@ button:focus-visible {
   margin-bottom: 9px;
 }
 
+.project-entry {
+  min-width: 0;
+  position: relative;
+}
+
 .project-row,
 .thread-row {
   width: 100%;
@@ -591,7 +596,7 @@ button:focus-visible {
 .project-row {
   height: 32px;
   gap: 8px;
-  padding: 0 7px;
+  padding: 0 36px 0 7px;
   color: #414a52;
   font-size: 13.5px;
   font-weight: 450;
@@ -664,7 +669,8 @@ button:focus-visible {
   background: #dfe6ec;
 }
 
-.thread-row-action {
+.thread-row-action,
+.project-row-action {
   width: 26px;
   height: 26px;
   position: absolute;
@@ -688,14 +694,18 @@ button:focus-visible {
 }
 
 .thread-entry:hover .thread-row-action,
+.project-entry:hover .project-row-action,
 .thread-row-action:focus-visible,
-.thread-row.selected + .thread-row-action {
+.project-row-action:focus-visible,
+.thread-row.selected + .thread-row-action,
+.project-row.current + .project-row-action {
   visibility: visible;
   opacity: 1;
   transition-delay: 0s;
 }
 
-.thread-row-action:hover {
+.thread-row-action:hover,
+.project-row-action:hover {
   background: #d5dde4;
 }
 
@@ -734,6 +744,20 @@ button:focus-visible {
 .sidebar-context-menu button:focus-visible {
   color: #2457a8;
   background: #edf3ff;
+}
+
+.sidebar-context-menu button.danger-menu-item {
+  color: #a74640;
+}
+
+.sidebar-context-menu button.danger-menu-item:hover,
+.sidebar-context-menu button.danger-menu-item:focus-visible {
+  color: #9d3731;
+  background: #fff0ee;
+}
+
+.project-context-menu {
+  width: 192px;
 }
 
 .workspace-profile {
@@ -3590,6 +3614,79 @@ button:focus-visible {
   margin-top: 4px;
 }
 
+.workspace-delete-backdrop {
+  z-index: 1350;
+  inset: 0;
+  background: rgb(34 40 46 / 30%);
+  backdrop-filter: blur(3px);
+}
+
+.workspace-delete-dialog {
+  width: min(500px, calc(100vw - 48px));
+  display: grid;
+  grid-template-columns: 42px minmax(0, 1fr);
+  gap: 14px;
+  padding: 22px;
+  border: 1px solid #ded6d4;
+  border-radius: 15px;
+  background: #fff;
+  box-shadow:
+    0 28px 80px rgb(24 35 46 / 24%),
+    0 2px 10px rgb(24 35 46 / 8%);
+}
+
+.workspace-delete-icon {
+  width: 42px;
+  height: 42px;
+  display: grid;
+  place-items: center;
+  border-radius: 11px;
+  color: #a6413b;
+  background: #fff0ee;
+}
+
+.workspace-delete-copy {
+  min-width: 0;
+}
+
+.workspace-delete-copy h2 {
+  margin: 1px 0 0;
+  color: #30383f;
+  font-size: 16px;
+  font-weight: 680;
+}
+
+.workspace-delete-copy p {
+  margin: 7px 0 0;
+  color: #68727b;
+  font-size: 12.5px;
+  line-height: 1.65;
+}
+
+.workspace-delete-copy code {
+  max-width: 100%;
+  display: block;
+  margin-top: 10px;
+  padding: 8px 10px;
+  overflow: hidden;
+  border: 1px solid #e0e5e9;
+  border-radius: 8px;
+  color: #68747e;
+  background: #f7f9fa;
+  font-family: inherit;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workspace-delete-dialog > footer {
+  grid-column: 1 / -1;
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 6px;
+}
+
 .settings-dialog {
   width: min(940px, calc(100vw - 64px));
   height: min(720px, calc(100vh - 92px));
@@ -4263,6 +4360,7 @@ button:focus-visible {
   display: inline-flex;
   align-items: center;
   justify-content: center;
+  gap: 7px;
   padding: 0 14px;
   border: 1px solid #e5b5b1;
   border-radius: 8px;
@@ -4276,6 +4374,11 @@ button:focus-visible {
 .danger-button:hover {
   border-color: #d9938d;
   background: #fff0ee;
+}
+
+.danger-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.58;
 }
 
 .editor-confirm-layer {
