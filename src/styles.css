@@ -1288,74 +1288,108 @@ button:focus-visible {
   width: min(100%, 738px);
   position: relative;
   margin: 0 auto;
-  padding-top: 38px;
+  padding-top: 0;
 }
 
 .project-context-picker {
-  width: calc(100% - 28px);
-  position: absolute;
-  z-index: 0;
-  top: 0;
-  left: 14px;
+  width: 100%;
+  min-height: 32px;
+  position: relative;
+  z-index: 3;
+  margin-bottom: 6px;
 }
 
-.project-context-bar {
+.project-context-line {
   width: 100%;
-  height: 50px;
+  height: 32px;
   display: flex;
-  align-items: flex-start;
-  gap: 8px;
-  padding: 12px 15px 0;
-  overflow: hidden;
-  border: 0;
-  border-radius: 18px 18px 0 0;
-  color: #444b51;
-  background: #f2f2f2;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  padding: 0 2px 0 8px;
+}
+
+.project-context-title,
+.project-context-bind {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: #626b73;
   font-family: inherit;
   font-size: 13px;
-  font-weight: 500;
-  text-align: left;
-  cursor: pointer;
-  transition:
-    color var(--motion-fast) ease,
-    background var(--motion-fast) ease;
+  font-weight: 520;
 }
 
-.project-context-bar:hover {
-  color: #22282d;
-  background: #ececec;
+.project-context-title svg,
+.project-context-bind svg {
+  flex: 0 0 auto;
+  color: #77828b;
 }
 
-.project-context-bar.selected {
-  color: #363d43;
-}
-
-.project-context-bar span {
+.project-context-title span,
+.project-context-bind span {
   min-width: 0;
-  flex: 1;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.project-context-bar > svg:last-child {
-  flex: 0 0 auto;
-  margin-top: 1px;
-  transition: transform var(--motion-base) ease;
+.project-context-bind {
+  height: 26px;
+  padding: 0 7px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  cursor: pointer;
+  transition:
+    color var(--motion-fast) ease,
+    background-color var(--motion-fast) ease;
 }
 
-.project-context-picker.open .project-context-bar > svg:last-child {
-  transform: rotate(180deg);
+.project-context-bind:hover {
+  color: #285fae;
+  background: #edf4ff;
+}
+
+.project-context-more {
+  width: 28px;
+  height: 28px;
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 7px;
+  color: #6f7981;
+  background: transparent;
+  cursor: pointer;
+  transition:
+    color var(--motion-fast) ease,
+    background-color var(--motion-fast) ease,
+    transform var(--motion-fast) ease;
+}
+
+.project-context-more:hover,
+.project-context-picker.open .project-context-more {
+  color: #285fae;
+  background: #eaf2ff;
+}
+
+.project-context-more:active {
+  transform: scale(0.94);
 }
 
 .project-context-menu {
-  width: min(520px, 100%);
+  width: min(340px, calc(100vw - 48px));
+  max-height: min(390px, calc(100vh - 170px));
   position: absolute;
   z-index: 88;
   bottom: calc(100% + 8px);
-  left: 0;
+  right: 0;
   padding: 7px;
-  overflow: hidden;
+  overflow-x: hidden;
+  overflow-y: auto;
   border: 1px solid #d5dde5;
   border-radius: 13px;
   visibility: hidden;
@@ -1365,7 +1399,7 @@ button:focus-visible {
     0 2px 8px rgb(24 36 48 / 7%);
   opacity: 0;
   transform: translateY(7px) scale(0.985);
-  transform-origin: bottom left;
+  transform-origin: bottom right;
   pointer-events: none;
   transition:
     opacity var(--motion-fast) ease,
@@ -1386,18 +1420,36 @@ button:focus-visible {
 }
 
 .project-context-menu > header {
-  display: flex;
-  flex-direction: column;
-  gap: 3px;
-  padding: 8px 10px 9px;
+  display: grid;
+  grid-template-columns: 34px minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+  padding: 8px 9px 10px;
 }
 
-.project-context-menu > header span {
+.project-context-menu-icon {
+  width: 34px;
+  height: 34px;
+  display: grid;
+  place-items: center;
+  border-radius: 9px;
+  color: #2864bf !important;
+  background: #eaf2ff;
+}
+
+.project-context-menu > header > div {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.project-context-menu > header > div > span {
   color: #87919a;
   font-size: 10.5px;
 }
 
-.project-context-menu > header strong {
+.project-context-menu > header > div > strong {
   overflow: hidden;
   color: #303941;
   font-size: 13px;
@@ -1407,20 +1459,20 @@ button:focus-visible {
 }
 
 .project-context-path {
-  min-height: 44px;
-  display: flex;
-  align-items: flex-start;
-  gap: 9px;
-  padding: 10px;
+  min-height: 58px;
+  position: relative;
+  display: grid;
+  gap: 4px;
+  padding: 9px 38px 9px 10px;
   border: 1px solid #dce4eb;
   border-radius: 9px;
   color: #506174;
   background: #f5f8fb;
 }
 
-.project-context-path svg {
-  flex: 0 0 auto;
-  margin-top: 2px;
+.project-context-path > span {
+  color: #87919a;
+  font-size: 10px;
 }
 
 .project-context-path code {
@@ -1433,25 +1485,50 @@ button:focus-visible {
   user-select: text;
 }
 
-.project-context-menu > footer {
-  display: flex;
-  align-items: center;
-  gap: 4px;
+.project-context-path > button {
+  width: 27px;
+  height: 27px;
+  position: absolute;
+  top: 8px;
+  right: 7px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 7px;
+  color: #607080;
+  background: transparent;
+  cursor: pointer;
+  transition:
+    color var(--motion-fast) ease,
+    background-color var(--motion-fast) ease;
+}
+
+.project-context-path > button:hover {
+  color: #255fbc;
+  background: #e4eefb;
+}
+
+.project-context-actions {
+  display: grid;
+  gap: 2px;
   padding-top: 6px;
 }
 
-.project-context-menu > footer button {
-  min-height: 34px;
-  display: inline-flex;
+.project-context-actions > button {
+  width: 100%;
+  min-height: 52px;
+  display: grid;
+  grid-template-columns: 24px minmax(0, 1fr) 16px;
   align-items: center;
-  gap: 6px;
-  padding: 0 9px;
+  gap: 9px;
+  padding: 7px 9px;
   border: 0;
   border-radius: 8px;
   color: #4c5964;
   background: transparent;
   font-family: inherit;
-  font-size: 11.5px;
+  text-align: left;
   cursor: pointer;
   transition:
     color var(--motion-fast) ease,
@@ -1459,13 +1536,39 @@ button:focus-visible {
     transform var(--motion-fast) ease;
 }
 
-.project-context-menu > footer button:hover,
-.project-context-menu > footer button:focus-visible {
+.project-context-actions > button > svg:first-child {
+  color: #647688;
+}
+
+.project-context-actions > button > span {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.project-context-actions strong {
+  color: #404b55;
+  font-size: 11.5px;
+  font-weight: 620;
+}
+
+.project-context-actions small {
+  color: #8a949d;
+  font-size: 10px;
+}
+
+.project-context-actions > button:hover,
+.project-context-actions > button:focus-visible {
   color: #255fbc;
   background: #edf4ff;
 }
 
-.project-context-menu > footer button:active {
+.project-context-actions > button:hover strong {
+  color: #255fbc;
+}
+
+.project-context-actions > button:active {
   transform: scale(0.98);
 }
 
@@ -3138,6 +3241,26 @@ button:focus-visible {
   font-size: 8px;
 }
 
+.resource-items button .resource-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 8.5px;
+  white-space: nowrap;
+}
+
+.resource-status.generating {
+  color: #2b65bf;
+}
+
+.resource-status.stopped {
+  color: #9a6a2e;
+}
+
+.resource-status.error {
+  color: #b04a45;
+}
+
 .hidden-file-input {
   display: none;
 }
@@ -4276,8 +4399,8 @@ button:focus-visible {
   font-size: 14px;
 }
 
-.project-context-bar {
-  font-size: 13px;
+.project-context-title {
+  font-size: 12.5px;
 }
 
 .round-button {

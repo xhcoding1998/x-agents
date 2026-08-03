@@ -599,6 +599,8 @@ async fn open_project_folder(path: String) -> Result<(), String> {
 async fn save_project_source(
     app: tauri::AppHandle,
     project_id: String,
+    project_root: Option<String>,
+    managed: bool,
     file_name: String,
     content: String,
 ) -> Result<String, String> {
@@ -619,9 +621,18 @@ async fn save_project_source(
         .path()
         .app_data_dir()
         .map_err(|error| format!("无法获取应用数据目录：{error}"))?;
-    let managed_output_dir = app_data_dir.join("outputs").join(&safe_project_id);
-    let project_dir = if managed_output_dir.exists() {
-        managed_output_dir.join("source")
+    let project_dir = if managed {
+        app_data_dir
+            .join("outputs")
+            .join(&safe_project_id)
+            .join("source")
+    } else if let Some(root) = project_root.filter(|root| !root.trim().is_empty()) {
+        let canonical_root = std::fs::canonicalize(Path::new(&root))
+            .map_err(|error| format!("无法访问绑定的项目目录：{error}"))?;
+        if !canonical_root.is_dir() {
+            return Err("绑定的项目路径不是文件夹".into());
+        }
+        canonical_root.join("source")
     } else {
         app_data_dir
             .join("projects")
@@ -637,7 +648,11 @@ async fn save_project_source(
 }
 
 #[tauri::command]
-async fn read_project_source(app: tauri::AppHandle, path: String) -> Result<String, String> {
+async fn read_project_source(
+    app: tauri::AppHandle,
+    path: String,
+    project_root: Option<String>,
+) -> Result<String, String> {
     if path.trim().is_empty() {
         return Err("原著文件路径为空".into());
     }
@@ -649,13 +664,17 @@ async fn read_project_source(app: tauri::AppHandle, path: String) -> Result<Stri
     let canonical_path = std::fs::canonicalize(Path::new(&path))
         .map_err(|error| format!("无法访问原著文件：{error}"))?;
 
-    let allowed = [app_data_dir.join("projects"), app_data_dir.join("outputs")]
+    let allowed_in_app_data = [app_data_dir.join("projects"), app_data_dir.join("outputs")]
         .iter()
         .filter(|root| root.exists())
         .filter_map(|root| std::fs::canonicalize(root).ok())
         .any(|root| canonical_path.starts_with(root));
+    let allowed_in_bound_project = project_root
+        .filter(|root| !root.trim().is_empty())
+        .and_then(|root| std::fs::canonicalize(Path::new(&root)).ok())
+        .is_some_and(|root| canonical_path.starts_with(root));
 
-    if !allowed {
+    if !allowed_in_app_data && !allowed_in_bound_project {
         return Err("拒绝读取项目资源目录之外的文件".into());
     }
 

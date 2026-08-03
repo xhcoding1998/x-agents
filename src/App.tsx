@@ -78,11 +78,17 @@ type Message = {
   status?: "stopped";
 };
 
-type MessageAction = {
-  type: "configure-model";
-  modelKind: ModelKind;
-  label: string;
-};
+type MessageAction =
+  | {
+      type: "configure-model";
+      modelKind: ModelKind;
+      label: string;
+    }
+  | {
+      type: "open-resource";
+      resourceId: string;
+      label: string;
+    };
 
 type StreamingMessage = {
   id: string;
@@ -101,6 +107,23 @@ type ActiveGeneration = {
   messageId: string;
   content: string;
   cancelled: boolean;
+  artifact?: ActiveTextArtifact;
+};
+
+type TextArtifactIntent = {
+  category: "原著";
+  title: string;
+  fileName: string;
+  operation: "create" | "continue";
+};
+
+type ActiveTextArtifact = {
+  context: WritableContext;
+  intent: TextArtifactIntent;
+  resource: ProjectResource;
+  baseContent: string;
+  lastQueuedLength: number;
+  writeChain: Promise<ProjectResource>;
 };
 
 type NovelCreationMode = "ai" | "blank";
@@ -134,6 +157,7 @@ type ProjectResource = {
   size?: number;
   path?: string;
   preview?: string;
+  status?: "generating" | "ready" | "stopped" | "error";
   createdAt: number;
 };
 
@@ -426,27 +450,101 @@ function normalizeNovelFileName(title: string) {
     : `${normalized}.md`;
 }
 
-function isDirectNovelCreationRequest(input: string) {
-  const asksForNovel = /(小说|原著|故事正文)/i.test(input);
-  const asksToCreate = /(写|创作|生成|新建|产出|起草)/i.test(input);
-  const asksForAnalysis =
-    /(分析|拆解|总结|梳理|大纲|目录|角色表|设定|分镜|剧本)/i.test(input);
-  return asksForNovel && asksToCreate && !asksForAnalysis;
+function createAvailableFileName(
+  desiredName: string,
+  resources: ProjectResource[],
+) {
+  const occupied = new Set(
+    resources.map((resource) => resource.name.toLocaleLowerCase()),
+  );
+  if (!occupied.has(desiredName.toLocaleLowerCase())) return desiredName;
+
+  const extensionMatch = desiredName.match(/(\.[^.]+)$/);
+  const extension = extensionMatch?.[1] ?? "";
+  const baseName = extension
+    ? desiredName.slice(0, -extension.length)
+    : desiredName;
+  let version = 2;
+  let candidate = `${baseName} (${version})${extension}`;
+  while (occupied.has(candidate.toLocaleLowerCase())) {
+    version += 1;
+    candidate = `${baseName} (${version})${extension}`;
+  }
+  return candidate;
 }
 
-function novelTitleFromRequest(input: string) {
-  const quotedTitle = input.match(/[《「“"]([^》」”"]{1,40})[》」”"]/u)?.[1];
-  if (quotedTitle) return quotedTitle;
-  const now = new Date();
-  const stamp = [
-    now.getFullYear(),
-    String(now.getMonth() + 1).padStart(2, "0"),
-    String(now.getDate()).padStart(2, "0"),
-    "-",
-    String(now.getHours()).padStart(2, "0"),
-    String(now.getMinutes()).padStart(2, "0"),
-  ].join("");
-  return `AI 创作小说 ${stamp}`;
+function createTextArtifactIntent(
+  input: string,
+  thread: Thread | null,
+  project: Project | null,
+): TextArtifactIntent | null {
+  const normalized = input.trim();
+  const asksToCreate =
+    /(写|创作|生成|新建|产出|起草|来一篇|来一个|完成|开始写)/i.test(
+      normalized,
+    );
+  const asksForNovel =
+    /(小说|原著|故事正文|短篇|长篇|章节|第一章|正文)/i.test(
+      normalized,
+    );
+  const asksToContinue =
+    /(继续写|接着写|续写|扩写|补写|写下一章|下一章|按上面.*写|完成正文)/i.test(
+      normalized,
+    );
+  const hasNovelContext = Boolean(
+    project?.resources.some((resource) => resource.category === "原著") ||
+      thread?.messages.some((message) =>
+        /(小说|原著|正文|章节)/i.test(message.content),
+      ),
+  );
+  const asksAQuestion =
+    /^(怎么|如何|为什么|能不能|是否可以|可不可以|请解释)/i.test(
+      normalized,
+    );
+
+  if (
+    asksAQuestion ||
+    !(
+      (asksToCreate && asksForNovel) ||
+      (asksToContinue && hasNovelContext)
+    )
+  ) {
+    return null;
+  }
+
+  const quotedTitle = normalized.match(
+    /[《「“"]([^》」”"]{1,40})[》」”"]/u,
+  )?.[1];
+  const conversationTitle =
+    thread?.title && thread.title !== "新任务"
+      ? thread.title
+          .replace(/^(创作|分析)[《「]/, "")
+          .replace(/[》」]$/, "")
+      : "";
+  const compactRequestTitle = normalized
+    .replace(
+      /^(请|麻烦|帮我|给我|直接|现在|开始|来)(再)?/,
+      "",
+    )
+    .replace(
+      /(写|创作|生成|新建|产出|起草|继续写|接着写|续写|扩写)/g,
+      "",
+    )
+    .replace(/[，。！？,.!?]/g, " ")
+    .trim()
+    .slice(0, 28);
+  const title =
+    quotedTitle ||
+    conversationTitle ||
+    compactRequestTitle ||
+    (asksToContinue ? "续写小说" : "未命名小说");
+
+  return {
+    category: "原著",
+    title,
+    fileName: normalizeNovelFileName(title),
+    operation: asksToContinue ? "continue" : "create",
+  };
 }
 
 function textByteLength(content: string) {
@@ -490,11 +588,48 @@ function modelKindName(kind: ModelKind) {
   return "对话模型";
 }
 
+function buildModelInput(
+  input: string,
+  thread: Thread | null,
+  project: Project | null,
+  artifactIntent: TextArtifactIntent | null,
+  continuationBase = "",
+) {
+  const recentConversation = (thread?.messages ?? [])
+    .filter((message) => message.role !== "system")
+    .slice(-6)
+    .map(
+      (message) =>
+        `${message.role === "user" ? "用户" : "Agent"}：${message.content.slice(-1800)}`,
+    )
+    .join("\n");
+  const latestNovel = artifactIntent
+    ? project?.resources.find(
+        (resource) => resource.category === "原著" && resource.preview,
+      )
+    : null;
+  const novelContext =
+    artifactIntent?.operation === "continue" &&
+    (continuationBase || latestNovel?.preview)
+      ? `\n\n现有原著末尾片段：\n${(
+          continuationBase ||
+          latestNovel?.preview ||
+          ""
+        ).slice(-6000)}`
+      : "";
+
+  return `${
+    recentConversation
+      ? `最近对话：\n${recentConversation}\n\n`
+      : ""
+  }当前请求：\n${input}${novelContext}`;
+}
+
 function buildAgentSystemPrompt(
   configs: ModelConfigs,
   project: Project | null,
   accessMode: AccessMode,
-  directNovelRequest = false,
+  artifactIntent: TextArtifactIntent | null = null,
 ) {
   const capability = (kind: ModelKind) => {
     const config = configs[kind];
@@ -534,7 +669,7 @@ function buildAgentSystemPrompt(
 5. 缺少对应模型配置时，不得声称已经生成图片或视频；应明确指出缺少的能力并等待客户端引导用户配置。
 6. 不要跳过用户确认直接批量消耗生成额度。
 7. 权限模式为“完全访问”时，不要要求用户先绑定项目文件夹；客户端会把需要落盘的内容保存到应用托管的 outputs 工作区。
-${directNovelRequest ? "8. 用户这次明确要求直接创作小说正文。只输出可保存的 Markdown 小说正文，不要输出权限提醒、保存说明或操作教程；客户端会在生成完成后自动落盘。" : ""}`;
+${artifactIntent ? `8. 本轮是原著文件产物任务，目标文件为“${artifactIntent.fileName}”。客户端已经创建文件并会持续保存你的输出；你只输出可直接写入文件的 Markdown 小说正文，不要输出权限提醒、保存说明、操作教程或“以下是”等开场白。` : ""}`;
 }
 
 function createThread(
@@ -1234,6 +1369,21 @@ function App() {
     }
   };
 
+  const persistProjectSource = async (
+    project: Project,
+    fileName: string,
+    content: string,
+  ) => {
+    const { invoke } = await import("@tauri-apps/api/core");
+    return invoke<string>("save_project_source", {
+      projectId: project.id,
+      projectRoot: project.rootPath,
+      managed: isManagedProject(project),
+      fileName,
+      content,
+    });
+  };
+
   const handleNovelImport = async (file: File | undefined) => {
     if (!file) return;
     const extension = file.name.split(".").pop()?.toLowerCase();
@@ -1249,14 +1399,14 @@ function App() {
 
     let savedPath = "";
     try {
-      const { invoke } = await import("@tauri-apps/api/core");
-      savedPath = await invoke<string>("save_project_source", {
-        projectId: context.project.id,
-        fileName: file.name,
+      savedPath = await persistProjectSource(
+        context.project,
+        file.name,
         content,
-      });
+      );
     } catch (error) {
-      setToast(`文件已载入，但本地保存失败：${String(error)}`);
+      setToast(`小说导入失败，未创建资源：${String(error)}`);
+      return;
     }
 
     const resource: ProjectResource = {
@@ -1267,6 +1417,7 @@ function App() {
       size: file.size,
       path: savedPath,
       preview: content.slice(0, 12000),
+      status: "ready",
       createdAt: Date.now(),
     };
 
@@ -1449,12 +1600,11 @@ function App() {
     const fileName = normalizeNovelFileName(title);
     const novelTitle = fileName.replace(/\.(txt|md|markdown)$/i, "");
     const conversationTitle = `创作《${novelTitle}》`;
-    const { invoke } = await import("@tauri-apps/api/core");
-    const savedPath = await invoke<string>("save_project_source", {
-      projectId: selectedProject.id,
+    const savedPath = await persistProjectSource(
+      selectedProject,
       fileName,
       content,
-    });
+    );
     const existing = selectedProject.resources.find(
       (resource) =>
         resource.category === "原著" && resource.name === fileName,
@@ -1467,6 +1617,7 @@ function App() {
       size: textByteLength(content),
       path: savedPath,
       preview: content.slice(0, 12000),
+      status: "ready",
       createdAt: existing?.createdAt ?? Date.now(),
     };
 
@@ -1507,39 +1658,116 @@ function App() {
     setToast("小说已保存，可随时继续编辑");
   };
 
-  const saveConversationNovel = async (
+  const prepareTextArtifact = async (
     context: WritableContext,
-    request: string,
-    content: string,
-  ) => {
-    const fileName = normalizeNovelFileName(
-      novelTitleFromRequest(request),
-    );
-    const { invoke } = await import("@tauri-apps/api/core");
-    const savedPath = await invoke<string>("save_project_source", {
-      projectId: context.project.id,
+    intent: TextArtifactIntent,
+  ): Promise<ActiveTextArtifact> => {
+    const existing =
+      intent.operation === "continue"
+        ? [...context.project.resources]
+            .filter(
+              (resource) => resource.category === intent.category,
+            )
+            .sort((left, right) => right.createdAt - left.createdAt)[0]
+        : undefined;
+    const fileName = existing
+      ? existing.name
+      : createAvailableFileName(
+          intent.fileName,
+          context.project.resources,
+        );
+    const resolvedIntent = {
+      ...intent,
       fileName,
-      content,
-    });
+    };
+    let baseContent = "";
+    if (existing?.path) {
+      const { invoke } = await import("@tauri-apps/api/core");
+      baseContent = await invoke<string>("read_project_source", {
+        path: existing.path,
+        projectRoot: context.project.rootPath,
+      });
+    } else if (existing?.preview) {
+      baseContent = existing.preview;
+    }
+    const savedPath = existing?.path
+      ? existing.path
+      : await persistProjectSource(
+          context.project,
+          resolvedIntent.fileName,
+          baseContent,
+        );
     const resource: ProjectResource = {
-      id: createId(),
-      name: fileName,
-      category: "原著",
+      id: existing?.id ?? createId(),
+      name: resolvedIntent.fileName,
+      category: resolvedIntent.category,
       kind: "text",
-      size: textByteLength(content),
+      size: textByteLength(baseContent),
       path: savedPath,
-      preview: content.slice(0, 12000),
-      createdAt: Date.now(),
+      preview: baseContent.slice(0, 12000),
+      status: "generating",
+      createdAt: existing?.createdAt ?? Date.now(),
     };
     updateProject(context.project.id, (project) => ({
       ...project,
       updatedAt: Date.now(),
-      resources: [resource, ...project.resources],
+      resources: [
+        resource,
+        ...project.resources.filter((item) => item.id !== resource.id),
+      ],
     }));
     setSelectedResourceId(resource.id);
     setRightTab("files");
     setRightOpen(true);
-    setToast(`小说已自动保存到 ${context.project.name}`);
+    setToast(`已创建文件「${resource.name}」，正在写入`);
+    return {
+      context,
+      intent: resolvedIntent,
+      resource,
+      baseContent,
+      lastQueuedLength: 0,
+      writeChain: Promise.resolve(resource),
+    };
+  };
+
+  const queueTextArtifactWrite = (
+    artifact: ActiveTextArtifact,
+    content: string,
+    status: ProjectResource["status"],
+  ) => {
+    artifact.lastQueuedLength = content.length;
+    artifact.writeChain = artifact.writeChain
+      .catch(() => artifact.resource)
+      .then(async () => {
+        const fileContent = artifact.baseContent
+          ? `${artifact.baseContent.trimEnd()}\n\n${content.trimStart()}`
+          : content;
+        const savedPath = await persistProjectSource(
+          artifact.context.project,
+          artifact.intent.fileName,
+          fileContent,
+        );
+        const resource: ProjectResource = {
+          ...artifact.resource,
+          size: textByteLength(fileContent),
+          path: savedPath,
+          preview: fileContent.slice(0, 12000),
+          status,
+        };
+        artifact.resource = resource;
+        updateProject(artifact.context.project.id, (project) => ({
+          ...project,
+          updatedAt: Date.now(),
+          resources: [
+            resource,
+            ...project.resources.filter(
+              (item) => item.id !== resource.id,
+            ),
+          ],
+        }));
+        return resource;
+      });
+    return artifact.writeChain;
   };
 
   const loadResourceContent = async (resource: ProjectResource) => {
@@ -1547,6 +1775,7 @@ function App() {
     const { invoke } = await import("@tauri-apps/api/core");
     return invoke<string>("read_project_source", {
       path: resource.path,
+      projectRoot: selectedProject?.rootPath ?? null,
     });
   };
 
@@ -1558,12 +1787,11 @@ function App() {
       throw new Error("当前任务尚未绑定项目文件夹");
     }
     if (!content.trim()) throw new Error("原著内容不能为空");
-    const { invoke } = await import("@tauri-apps/api/core");
-    const savedPath = await invoke<string>("save_project_source", {
-      projectId: selectedProject.id,
-      fileName: resource.name,
+    const savedPath = await persistProjectSource(
+      selectedProject,
+      resource.name,
       content,
-    });
+    );
     updateProject(selectedProject.id, (project) => ({
       ...project,
       updatedAt: Date.now(),
@@ -1574,6 +1802,7 @@ function App() {
               path: savedPath,
               size: textByteLength(content),
               preview: content.slice(0, 12000),
+              status: "ready",
             }
           : item,
       ),
@@ -1599,24 +1828,45 @@ function App() {
     if (!input || isResponding) return;
 
     const config = modelConfigs.chat;
+    const artifactIntent = createTextArtifactIntent(
+      input,
+      selectedThread,
+      selectedProject,
+    );
     const requiredKinds = [
       ...(!isModelConfigured(config)
         ? (["chat"] as ModelKind[])
         : []),
-      ...requiredGenerationModels(input).filter(
-        (kind) => !isModelConfigured(modelConfigs[kind]),
-      ),
+      ...(artifactIntent
+        ? []
+        : requiredGenerationModels(input).filter(
+            (kind) => !isModelConfigured(modelConfigs[kind]),
+          )),
     ].filter(
       (kind, index, kinds) => kinds.indexOf(kind) === index,
     );
-    const directNovelRequest = isDirectNovelCreationRequest(input);
     const writableContext =
-      directNovelRequest && requiredKinds.length === 0
+      artifactIntent && requiredKinds.length === 0
         ? await ensureWritableContext("创作小说并保存为原著文件")
         : null;
+    if (artifactIntent && requiredKinds.length === 0 && !writableContext) {
+      return;
+    }
     const promptProject = writableContext?.project ?? selectedProject;
     const thread =
       writableContext?.thread ?? selectedThread ?? createThread();
+    let activeArtifact: ActiveTextArtifact | undefined;
+    if (artifactIntent && writableContext) {
+      try {
+        activeArtifact = await prepareTextArtifact(
+          writableContext,
+          artifactIntent,
+        );
+      } catch (error) {
+        setToast(`无法创建小说文件，已停止生成：${String(error)}`);
+        return;
+      }
+    }
     const userMessage = createMessage("user", input);
     const guideMessage =
       requiredKinds.length > 0
@@ -1690,6 +1940,7 @@ function App() {
       messageId,
       content: "",
       cancelled: false,
+      artifact: activeArtifact,
     };
     setStreamingMessage({
       id: messageId,
@@ -1729,6 +1980,17 @@ function App() {
             threadId: active.threadId,
             content: active.content,
           });
+          if (
+            active.artifact &&
+            active.content.length - active.artifact.lastQueuedLength >=
+              6000
+          ) {
+            void queueTextArtifactWrite(
+              active.artifact,
+              active.content,
+              "generating",
+            ).catch(() => undefined);
+          }
         }
       };
 
@@ -1740,12 +2002,18 @@ function App() {
         model: config.model,
         apiPath: config.apiPath,
         headersJson: config.headers,
-        input,
+        input: buildModelInput(
+          input,
+          selectedThread,
+          promptProject,
+          artifactIntent,
+          activeArtifact?.baseContent,
+        ),
         systemPrompt: buildAgentSystemPrompt(
           modelConfigs,
           promptProject,
           accessMode,
-          directNovelRequest,
+          activeArtifact?.intent ?? artifactIntent,
         ),
         onEvent,
       });
@@ -1754,34 +2022,66 @@ function App() {
       const completed = activeGenerationRef.current;
       if (!completed || completed.requestId !== requestId) return;
       if (completed.content.trim()) {
+        let completionMessage: Message;
+        let saveFailureMessage: Message | null = null;
+        if (completed.artifact) {
+          try {
+            const resource = await queueTextArtifactWrite(
+              completed.artifact,
+              completed.content,
+              "ready",
+            );
+            completionMessage = createMessage(
+              "assistant",
+              `小说已经生成并写入文件 **${resource.name}**。完整正文已保存到当前工程，右侧“原著”资源已同步。`,
+              [
+                {
+                  type: "open-resource",
+                  resourceId: resource.id,
+                  label: "查看小说文件",
+                },
+              ],
+            );
+            setSelectedResourceId(resource.id);
+            setRightTab("files");
+            setRightOpen(true);
+            setToast(`已保存「${resource.name}」并同步到资源栏`);
+          } catch (saveError) {
+            completionMessage = createMessage(
+              "assistant",
+              completed.content,
+            );
+            saveFailureMessage = createMessage(
+              "system",
+              `小说内容已生成，但文件写入失败：${String(saveError)}`,
+            );
+            updateProject(
+              completed.artifact.context.project.id,
+              (project) => ({
+                ...project,
+                resources: project.resources.map((resource) =>
+                  resource.id === completed.artifact?.resource.id
+                    ? { ...resource, status: "error" }
+                    : resource,
+                ),
+              }),
+            );
+          }
+        } else {
+          completionMessage = createMessage(
+            "assistant",
+            completed.content,
+          );
+        }
         updateThread(threadId, (item) => ({
           ...item,
           updatedAt: Date.now(),
           messages: [
             ...item.messages,
-            createMessage("assistant", completed.content),
+            completionMessage,
+            ...(saveFailureMessage ? [saveFailureMessage] : []),
           ],
         }));
-        if (directNovelRequest && writableContext) {
-          try {
-            await saveConversationNovel(
-              writableContext,
-              input,
-              completed.content,
-            );
-          } catch (saveError) {
-            updateThread(threadId, (item) => ({
-              ...item,
-              messages: [
-                ...item.messages,
-                createMessage(
-                  "system",
-                  `小说正文已生成，但自动保存失败：${String(saveError)}`,
-                ),
-              ],
-            }));
-          }
-        }
       }
       activeGenerationRef.current = null;
       setStreamingMessage(null);
@@ -1792,14 +2092,53 @@ function App() {
       activeGenerationRef.current = null;
       setStreamingMessage(null);
       setIsResponding(false);
+      const failureMessages: Message[] = [];
+      if (failed.artifact && failed.content.trim()) {
+        try {
+          const resource = await queueTextArtifactWrite(
+            failed.artifact,
+            failed.content,
+            "error",
+          );
+          failureMessages.push(
+            createMessage(
+              "assistant",
+              `生成意外中断，已将现有内容保存为 **${resource.name}**，可以从右侧资源继续编辑。`,
+              [
+                {
+                  type: "open-resource",
+                  resourceId: resource.id,
+                  label: "查看已保存草稿",
+                },
+              ],
+            ),
+          );
+        } catch {
+          failureMessages.push(
+            {
+              ...createMessage("assistant", failed.content),
+              status: "stopped",
+            },
+          );
+        }
+      } else if (failed.artifact) {
+        updateProject(failed.artifact.context.project.id, (project) => ({
+          ...project,
+          resources: project.resources.map((resource) =>
+            resource.id === failed.artifact?.resource.id
+              ? { ...resource, status: "error" }
+              : resource,
+          ),
+        }));
+      }
+      failureMessages.push(
+        createMessage("system", `模型请求失败：${String(error)}`),
+      );
       updateThread(threadId, (item) => ({
         ...item,
         messages: [
           ...item.messages,
-          createMessage(
-            "system",
-            `模型请求失败：${String(error)}`,
-          ),
+          ...failureMessages,
         ],
       }));
     }
@@ -1818,28 +2157,56 @@ function App() {
     setStreamingMessage(null);
     setIsResponding(false);
 
-    if (active.content.trim()) {
-      updateThread(active.threadId, (thread) => ({
-        ...thread,
-        updatedAt: Date.now(),
-        messages: [
-          ...thread.messages,
-          {
+    void (async () => {
+      let stoppedMessage: Message;
+      if (active.artifact) {
+        try {
+          const resource = await queueTextArtifactWrite(
+            active.artifact,
+            active.content,
+            "stopped",
+          );
+          stoppedMessage = {
+            ...createMessage(
+              "assistant",
+              active.content.trim()
+                ? `已停止继续生成，当前内容已保存为草稿 **${resource.name}**，可以从右侧资源继续编辑。`
+                : `已停止生成，已保留空白草稿 **${resource.name}**。`,
+              [
+                {
+                  type: "open-resource",
+                  resourceId: resource.id,
+                  label: "查看草稿文件",
+                },
+              ],
+            ),
+            status: "stopped",
+          };
+          setSelectedResourceId(resource.id);
+          setRightTab("files");
+          setRightOpen(true);
+          setToast("已停止生成，现有小说内容已保存为草稿");
+        } catch {
+          stoppedMessage = {
             ...createMessage("assistant", active.content),
             status: "stopped",
-          },
-        ],
-      }));
-    } else {
+          };
+        }
+      } else if (active.content.trim()) {
+        stoppedMessage = {
+          ...createMessage("assistant", active.content),
+          status: "stopped",
+        };
+      } else {
+        stoppedMessage = createMessage("system", "已停止生成");
+      }
+
       updateThread(active.threadId, (thread) => ({
         ...thread,
         updatedAt: Date.now(),
-        messages: [
-          ...thread.messages,
-          createMessage("system", "已停止生成"),
-        ],
+        messages: [...thread.messages, stoppedMessage],
       }));
-    }
+    })();
 
     void import("@tauri-apps/api/core")
       .then(({ invoke }) =>
@@ -2166,6 +2533,12 @@ function App() {
             onConfigureModel={(kind) => {
               setActiveModelKind(kind);
               setSettingsDialogOpen(true);
+            }}
+            onOpenResource={(resourceId) => {
+              setSelectedResourceId(resourceId);
+              setRightTab("files");
+              setRightOpen(true);
+              setResourcePreviewOpen(true);
             }}
             onToggleRight={() => setRightOpen((open) => !open)}
           />
@@ -2881,6 +3254,7 @@ function ChatView({
   onOpenSettings,
   onSelectModel,
   onConfigureModel,
+  onOpenResource,
   onToggleRight,
 }: {
   project: Project | null;
@@ -2908,6 +3282,7 @@ function ChatView({
   onOpenSettings: () => void;
   onSelectModel: (model: string) => void;
   onConfigureModel: (kind: ModelKind) => void;
+  onOpenResource: (resourceId: string) => void;
   onToggleRight: () => void;
 }) {
   const chatScrollRef = useRef<HTMLDivElement>(null);
@@ -3078,15 +3453,23 @@ function ChatView({
                         <div className="message-quick-actions">
                           {message.actions.map((action) => (
                             <button
-                              key={`${message.id}-${action.modelKind}`}
+                              key={`${message.id}-${
+                                action.type === "configure-model"
+                                  ? action.modelKind
+                                  : action.resourceId
+                              }`}
                               type="button"
-                              onClick={() =>
-                                onConfigureModel(
-                                  action.modelKind,
-                                )
-                              }
+                              onClick={() => {
+                                if (action.type === "configure-model") {
+                                  onConfigureModel(action.modelKind);
+                                } else {
+                                  onOpenResource(action.resourceId);
+                                }
+                              }}
                             >
-                              {action.modelKind === "image" ? (
+                              {action.type === "open-resource" ? (
+                                <FileText size={15} />
+                              ) : action.modelKind === "image" ? (
                                 <ImageIcon size={15} />
                               ) : action.modelKind === "video" ? (
                                 <Video size={15} />
@@ -3157,34 +3540,35 @@ function ChatView({
               projectMenuOpen ? "open" : ""
             }`}
           >
-            <button
-              type="button"
-              className={`project-context-bar ${
-                project ? "selected" : ""
-              }`}
-              onClick={() =>
-                project
-                  ? setProjectMenuOpen((current) => !current)
-                  : onChooseFolder()
-              }
-              aria-haspopup={project ? "menu" : undefined}
-              aria-expanded={project ? projectMenuOpen : undefined}
-              aria-controls={project ? "project-context-menu" : undefined}
-            >
-              {project ? (
-                <FolderOpen size={15} />
-              ) : (
-                <Folder size={15} />
-              )}
-              <span>
-                {project
-                  ? thread?.title ?? project.name
-                  : "选择项目文件夹"}
-              </span>
-              {project && <ChevronDown size={13} />}
-            </button>
+            <div className="project-context-line">
+              <div className="project-context-title">
+                {project ? (
+                  <FolderOpen size={14} />
+                ) : (
+                  <Folder size={14} />
+                )}
+                <span>
+                  {project
+                    ? thread?.title ?? project.name
+                    : "未绑定项目文件夹"}
+                </span>
+              </div>
+              <button
+                type="button"
+                className="project-context-more"
+                onClick={() =>
+                  setProjectMenuOpen((current) => !current)
+                }
+                aria-label="项目目录选项"
+                aria-haspopup="menu"
+                aria-expanded={projectMenuOpen}
+                aria-controls="project-context-menu"
+              >
+                <MoreHorizontal size={17} />
+              </button>
+            </div>
 
-            {project && (
+            {project ? (
               <div
                 id="project-context-menu"
                 className="project-context-menu ui-popover"
@@ -3193,52 +3577,108 @@ function ChatView({
                 aria-hidden={!projectMenuOpen}
               >
                 <header>
-                  <span>
-                    {isManagedProject(project)
-                      ? "应用托管输出"
-                      : "本地项目"}
+                  <span className="project-context-menu-icon">
+                    {isManagedProject(project) ? (
+                      <Save size={17} />
+                    ) : (
+                      <FolderOpen size={17} />
+                    )}
                   </span>
-                  <strong>{thread?.title ?? project.name}</strong>
+                  <div>
+                    <strong>{thread?.title ?? project.name}</strong>
+                    <span>
+                      {isManagedProject(project)
+                        ? "应用托管输出目录"
+                        : "本地项目目录"}
+                    </span>
+                  </div>
                 </header>
                 <div className="project-context-path">
-                  <Folder size={15} />
+                  <span>存储位置</span>
                   <code title={project.rootPath}>{project.rootPath}</code>
+                  <button
+                    type="button"
+                    tabIndex={projectMenuOpen ? 0 : -1}
+                    onClick={() => {
+                      setProjectMenuOpen(false);
+                      onCopyProjectPath();
+                    }}
+                    aria-label="复制项目路径"
+                    title="复制路径"
+                  >
+                    <Copy size={14} />
+                  </button>
                 </div>
-                <footer>
+                <div className="project-context-actions">
                   <button
                     type="button"
                     role="menuitem"
+                    tabIndex={projectMenuOpen ? 0 : -1}
                     onClick={() => {
                       setProjectMenuOpen(false);
                       onOpenProjectFolder();
                     }}
                   >
-                    <FolderOpen size={15} />
-                    打开目录
+                    <FolderOpen size={16} />
+                    <span>
+                      <strong>在文件资源管理器中打开</strong>
+                      <small>查看该任务生成的全部工程文件</small>
+                    </span>
+                    <ChevronRight size={14} />
                   </button>
                   <button
                     type="button"
                     role="menuitem"
-                    onClick={() => {
-                      setProjectMenuOpen(false);
-                      onCopyProjectPath();
-                    }}
-                  >
-                    <Copy size={15} />
-                    复制路径
-                  </button>
-                  <button
-                    type="button"
-                    role="menuitem"
+                    tabIndex={projectMenuOpen ? 0 : -1}
                     onClick={() => {
                       setProjectMenuOpen(false);
                       onChooseFolder();
                     }}
                   >
-                    <Folder size={15} />
-                    更换文件夹
+                    <Folder size={16} />
+                    <span>
+                      <strong>更换项目文件夹</strong>
+                      <small>把当前对话切换到另一个本地工程</small>
+                    </span>
+                    <ChevronRight size={14} />
                   </button>
-                </footer>
+                </div>
+              </div>
+            ) : (
+              <div
+                id="project-context-menu"
+                className="project-context-menu ui-popover"
+                role="menu"
+                aria-label="项目目录"
+                aria-hidden={!projectMenuOpen}
+              >
+                <header>
+                  <span className="project-context-menu-icon">
+                    <Folder size={17} />
+                  </span>
+                  <div>
+                    <strong>尚未绑定项目目录</strong>
+                    <span>绑定后，文件会直接写入所选工程</span>
+                  </div>
+                </header>
+                <div className="project-context-actions">
+                  <button
+                    type="button"
+                    role="menuitem"
+                    tabIndex={projectMenuOpen ? 0 : -1}
+                    onClick={() => {
+                      setProjectMenuOpen(false);
+                      onChooseFolder();
+                    }}
+                  >
+                    <FolderOpen size={16} />
+                    <span>
+                      <strong>选择项目文件夹</strong>
+                      <small>将当前对话绑定为一个本地工程</small>
+                    </span>
+                    <ChevronRight size={14} />
+                  </button>
+                </div>
               </div>
             )}
           </div>
@@ -4483,9 +4923,18 @@ function ResourceGroup({
                 <File size={14} />
               )}
               <span>{resource.name}</span>
-              {resource.size && (
+              {resource.status === "generating" ? (
+                <small className="resource-status generating">
+                  <RotateCcw size={10} className="spin" />
+                  写入中
+                </small>
+              ) : resource.status === "stopped" ? (
+                <small className="resource-status stopped">草稿</small>
+              ) : resource.status === "error" ? (
+                <small className="resource-status error">写入异常</small>
+              ) : resource.size ? (
                 <small>{formatBytes(resource.size)}</small>
-              )}
+              ) : null}
             </button>
           ))}
         </div>
