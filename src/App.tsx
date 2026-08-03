@@ -100,6 +100,8 @@ type StreamingMessage = {
     fileName: string;
     generatedCharacters: number;
     persistedCharacters: number;
+    sequenceIndex?: number;
+    sequenceTotal?: number;
   };
 };
 
@@ -123,6 +125,11 @@ type TextArtifactIntent = {
   title: string;
   fileName: string;
   operation: "create" | "continue";
+  displayName?: string;
+  folder?: string;
+  artifactRole?: "summary" | "chapter" | "manuscript";
+  sequenceIndex?: number;
+  sequenceTotal?: number;
 };
 
 type ActiveTextArtifact = {
@@ -138,8 +145,19 @@ type ActiveTextArtifact = {
 
 type TurnMetadataPlan = {
   conversationTitle: string;
-  artifactTitle?: string;
-  fileName?: string;
+  novel?: NovelDirectoryPlan;
+};
+
+type NovelDirectoryPlan = {
+  title: string;
+  directoryName: string;
+  summaryFileName: string;
+  overview: string;
+  chapters: Array<{
+    title: string;
+    fileName: string;
+    brief: string;
+  }>;
 };
 
 type NovelCreationMode = "ai" | "blank";
@@ -173,6 +191,9 @@ type ProjectResource = {
   size?: number;
   path?: string;
   preview?: string;
+  relativePath?: string;
+  folder?: string;
+  artifactRole?: "summary" | "chapter" | "manuscript";
   status?: "generating" | "ready" | "stopped" | "error";
   createdAt: number;
 };
@@ -466,12 +487,31 @@ function normalizeNovelFileName(title: string) {
     : `${normalized}.md`;
 }
 
+function normalizeDirectoryName(value: string) {
+  return (
+    value
+      .trim()
+      .replace(/[<>:"/\\|?*\u0000-\u001f]/g, "-")
+      .replace(/[. ]+$/g, "")
+      .slice(0, 48) || "未命名小说"
+  );
+}
+
+function normalizeMarkdownFileName(value: string) {
+  return normalizeNovelFileName(value).replace(
+    /\.(txt|markdown)$/i,
+    ".md",
+  );
+}
+
 function createAvailableFileName(
   desiredName: string,
   resources: ProjectResource[],
 ) {
   const occupied = new Set(
-    resources.map((resource) => resource.name.toLocaleLowerCase()),
+    resources.map((resource) =>
+      (resource.relativePath ?? resource.name).toLocaleLowerCase(),
+    ),
   );
   if (!occupied.has(desiredName.toLocaleLowerCase())) return desiredName;
 
@@ -485,6 +525,26 @@ function createAvailableFileName(
   while (occupied.has(candidate.toLocaleLowerCase())) {
     version += 1;
     candidate = `${baseName} (${version})${extension}`;
+  }
+  return candidate;
+}
+
+function createAvailableDirectoryName(
+  desiredName: string,
+  resources: ProjectResource[],
+) {
+  const occupied = new Set(
+    resources
+      .map((resource) => resource.folder)
+      .filter((folder): folder is string => Boolean(folder))
+      .map((folder) => folder.toLocaleLowerCase()),
+  );
+  if (!occupied.has(desiredName.toLocaleLowerCase())) return desiredName;
+  let version = 2;
+  let candidate = `${desiredName} (${version})`;
+  while (occupied.has(candidate.toLocaleLowerCase())) {
+    version += 1;
+    candidate = `${desiredName} (${version})`;
   }
   return candidate;
 }
@@ -677,20 +737,65 @@ function parseTurnMetadataPlan(
 
   if (!needsArtifact) return { conversationTitle };
 
-  const artifactTitle = String(parsed.artifactTitle ?? "")
+  const rawNovel = parsed.novel;
+  if (!rawNovel || typeof rawNovel !== "object") {
+    throw new Error("模型没有返回小说目录规划");
+  }
+  const novel = rawNovel as Record<string, unknown>;
+  const title = String(novel.title ?? "")
     .replace(/[\r\n]/g, " ")
     .replace(/^[《「“\"']+|[》」”\"']+$/g, "")
     .trim()
     .slice(0, 40);
-  const rawFileName = String(parsed.fileName ?? "").trim();
-  if (!artifactTitle || !rawFileName) {
-    throw new Error("模型没有生成可用的作品名或文件名");
+  const rawDirectoryName = String(novel.directoryName ?? "").trim();
+  const rawSummaryFileName = String(
+    novel.summaryFileName ?? "",
+  ).trim();
+  if (!rawDirectoryName || !rawSummaryFileName) {
+    throw new Error("模型没有生成小说目录名或总览文件名");
   }
-  const fileName = normalizeNovelFileName(rawFileName).replace(
-    /\.(txt|markdown)$/i,
-    ".md",
+  const directoryName = normalizeDirectoryName(rawDirectoryName);
+  const summaryFileName = normalizeMarkdownFileName(
+    rawSummaryFileName,
   );
-  return { conversationTitle, artifactTitle, fileName };
+  const overview = String(novel.overview ?? "").trim();
+  const rawChapters = Array.isArray(novel.chapters)
+    ? novel.chapters
+    : [];
+  const chapters = rawChapters.slice(0, 20).map((item, index) => {
+    const chapter = item as Record<string, unknown>;
+    const chapterTitle = String(chapter.title ?? "").trim();
+    const fileName = normalizeMarkdownFileName(
+      String(chapter.fileName ?? ""),
+    );
+    const brief = String(chapter.brief ?? "").trim();
+    if (!chapterTitle || !fileName || !brief) {
+      throw new Error(`第 ${index + 1} 章的规划信息不完整`);
+    }
+    return { title: chapterTitle, fileName, brief };
+  });
+  if (!title || !overview || chapters.length < 4) {
+    throw new Error("小说规划至少需要作品名、故事总览和 4 个完整章节");
+  }
+  const uniqueFiles = new Set(
+    chapters.map((chapter) => chapter.fileName.toLocaleLowerCase()),
+  );
+  if (uniqueFiles.size !== chapters.length) {
+    throw new Error("模型返回了重复的章节文件名");
+  }
+  if (uniqueFiles.has(summaryFileName.toLocaleLowerCase())) {
+    throw new Error("作品总览与章节文件不能使用同一个文件名");
+  }
+  return {
+    conversationTitle,
+    novel: {
+      title,
+      directoryName,
+      summaryFileName,
+      overview,
+      chapters,
+    },
+  };
 }
 
 async function requestChatText(
@@ -741,15 +846,55 @@ async function planTurnMetadata(
     `用户本轮请求：\n${input}`,
     `你是 Agent 客户端的任务命名与文件规划器。只返回一行严格 JSON，不要 Markdown、代码围栏或解释。\n\nJSON 字段：\n- conversationTitle：6 到 16 个中文字符，准确概括用户目标，不使用日期、“新任务”、“用户请求”等空泛词。\n${
       needsArtifact
-        ? "- artifactTitle：适合作品展示的简短中文小说名。\n- fileName：与作品名一致、适合本地保存的简短 Markdown 文件名，必须以 .md 结尾，不包含路径或非法字符。"
-        : "本轮不是文件命名任务，不要输出 artifactTitle 和 fileName。"
+        ? '- novel：小说目录规划对象，包含 title、directoryName、summaryFileName、overview、chapters。chapters 是章节数组，每章必须包含 title、fileName、brief。若用户未指定篇幅，规划 8 章；每章未来应能展开为 2500 至 4000 字。所有文件名必须简短、唯一、以 .md 结尾，并按 01、02 顺序编号。overview 为全书梗概，brief 为该章剧情小结。'
+        : "本轮不是小说目录任务，不要输出 novel。"
     }\n\n示例：${
       needsArtifact
-        ? '{"conversationTitle":"创作赛博悬疑短篇","artifactTitle":"雾港回声","fileName":"雾港回声.md"}'
+        ? '{"conversationTitle":"创作赛博悬疑小说","novel":{"title":"雾港回声","directoryName":"雾港回声","summaryFileName":"00-作品总览.md","overview":"失忆潜水员追查港城异常潮汐背后的旧案。","chapters":[{"title":"潮汐来信","fileName":"01-潮汐来信.md","brief":"主角收到来自失踪妹妹的旧式电报码。"},{"title":"沉船名单","fileName":"02-沉船名单.md","brief":"调查指向十年前被抹去的事故。"},{"title":"深水来客","fileName":"03-深水来客.md","brief":"一名陌生潜水员带来事故幸存者的线索。"},{"title":"雾中证人","fileName":"04-雾中证人.md","brief":"唯一证人的记忆出现矛盾。"},{"title":"失真航线","fileName":"05-失真航线.md","brief":"被篡改的航行记录暴露港务局内鬼。"},{"title":"沉城回声","fileName":"06-沉城回声.md","brief":"主角潜入旧城遗址寻找最后一段录音。"},{"title":"记忆潮汐","fileName":"07-记忆潮汐.md","brief":"妹妹失踪与主角失忆的真相同时浮现。"},{"title":"回声尽头","fileName":"08-回声尽头.md","brief":"主角在记忆与现实之间完成最终选择。"}]}}'
         : '{"conversationTitle":"拆解第一章分镜"}'
     }`,
   );
   return parseTurnMetadataPlan(raw, needsArtifact);
+}
+
+function buildNovelOverviewMarkdown(
+  plan: NovelDirectoryPlan,
+  completed: Array<{ fileName: string; characters: number }> = [],
+) {
+  const completedByFile = new Map(
+    completed.map((item) => [item.fileName, item.characters]),
+  );
+  const completedCharacters = completed.reduce(
+    (total, item) => total + item.characters,
+    0,
+  );
+  return `# ${plan.title}
+
+## 故事总览
+
+${plan.overview}
+
+## 章节目录与小结
+
+${plan.chapters
+  .map((chapter, index) => {
+    const characters = completedByFile.get(chapter.fileName);
+    return `${characters === undefined ? "- [ ]" : "- [x]"} ${String(
+      index + 1,
+    ).padStart(2, "0")} · [${chapter.title}](./${chapter.fileName})\n  - ${chapter.brief}${
+      characters === undefined
+        ? ""
+        : `\n  - 已完成 ${characters.toLocaleString()} 字`
+    }`;
+  })
+  .join("\n")}
+
+## 创作进度小结
+
+- 计划章节：${plan.chapters.length} 章
+- 已完成：${completed.length} 章
+- 已生成正文：${completedCharacters.toLocaleString()} 字
+`;
 }
 
 function createThread(
@@ -1572,8 +1717,18 @@ function App() {
       setToast("AI 创作小说前需要先配置对话模型");
       return;
     }
+    if (mode === "ai") {
+      setComposer((current) =>
+        current.trim()
+          ? current
+          : "请根据以下构想创作一部完整的中文小说，并按作品目录、作品总览、分章正文和章节小结保存：\n",
+      );
+      window.requestAnimationFrame(() => composerRef.current?.focus());
+      setToast("请在输入框补充题材、人物或故事构想后发送");
+      return;
+    }
     const context = await ensureWritableContext(
-      mode === "ai" ? "创作并保存 AI 小说" : "新建并保存空白小说",
+      "新建并保存空白小说",
     );
     if (!context) return;
     setNovelCreationMode(mode);
@@ -1750,12 +1905,14 @@ function App() {
       intent.operation === "continue"
         ? [...context.project.resources]
             .filter(
-              (resource) => resource.category === intent.category,
+              (resource) =>
+                resource.category === intent.category &&
+                resource.artifactRole !== "summary",
             )
             .sort((left, right) => right.createdAt - left.createdAt)[0]
         : undefined;
     const fileName = existing
-      ? existing.name
+      ? existing.relativePath ?? existing.name
       : createAvailableFileName(
           intent.fileName,
           context.project.resources,
@@ -1763,6 +1920,9 @@ function App() {
     const resolvedIntent = {
       ...intent,
       fileName,
+      displayName: intent.displayName ?? existing?.name,
+      folder: intent.folder ?? existing?.folder,
+      artifactRole: intent.artifactRole ?? existing?.artifactRole,
     };
     let baseContent = "";
     if (existing?.path) {
@@ -1783,12 +1943,19 @@ function App() {
         );
     const resource: ProjectResource = {
       id: existing?.id ?? createId(),
-      name: resolvedIntent.fileName,
+      name:
+        resolvedIntent.displayName ??
+        resolvedIntent.fileName.split(/[\\/]/).at(-1) ??
+        resolvedIntent.fileName,
       category: resolvedIntent.category,
       kind: "text",
       size: textByteLength(baseContent),
       path: savedPath,
       preview: baseContent.slice(0, 12000),
+      relativePath: resolvedIntent.fileName,
+      folder: resolvedIntent.folder,
+      artifactRole:
+        resolvedIntent.artifactRole ?? existing?.artifactRole ?? "manuscript",
       status: "generating",
       createdAt: existing?.createdAt ?? Date.now(),
     };
@@ -1871,6 +2038,8 @@ function App() {
         fileName: artifact?.resource.name ?? "正在规划小说文件",
         generatedCharacters: active.content.length,
         persistedCharacters: artifact?.lastPersistedLength ?? 0,
+        sequenceIndex: artifact?.intent.sequenceIndex,
+        sequenceTotal: artifact?.intent.sequenceTotal,
       },
     });
   };
@@ -1934,7 +2103,7 @@ function App() {
     if (!content.trim()) throw new Error("原著内容不能为空");
     const savedPath = await persistProjectSource(
       selectedProject,
-      resource.name,
+      resource.relativePath ?? resource.name,
       content,
     );
     updateProject(selectedProject.id, (project) => ({
@@ -1966,6 +2135,299 @@ function App() {
       }));
     }
     setToast("原著修改已保存");
+  };
+
+  const streamArtifactContent = async (
+    config: ModelConfig,
+    active: ActiveGeneration,
+    input: string,
+    systemPrompt: string,
+  ) => {
+    const { Channel, invoke } = await import("@tauri-apps/api/core");
+    const onEvent = new Channel<ChatStreamEvent>();
+    let settleStream: () => void = () => undefined;
+    const streamSettled = new Promise<void>((resolve) => {
+      settleStream = resolve;
+    });
+    onEvent.onmessage = (event) => {
+      if (event.event === "finished" || event.event === "cancelled") {
+        settleStream();
+      }
+      const current = activeGenerationRef.current;
+      if (
+        !current ||
+        current.requestId !== active.requestId ||
+        current.cancelled
+      ) {
+        return;
+      }
+      if (event.event === "delta" && event.data) {
+        current.content += event.data;
+        showArtifactProgress(current, "writing");
+        scheduleArtifactCheckpoint(current);
+      }
+    };
+
+    await invoke<void>("stream_chat_message", {
+      requestId: active.requestId,
+      provider: config.provider,
+      baseUrl: config.baseUrl,
+      apiKey: config.apiKey,
+      model: config.model,
+      apiPath: config.apiPath,
+      headersJson: config.headers,
+      input,
+      systemPrompt,
+      onEvent,
+    });
+    await streamSettled;
+    const completed = activeGenerationRef.current;
+    if (!completed || completed.requestId !== active.requestId) {
+      return null;
+    }
+    clearArtifactCheckpoint(completed.artifact);
+    return completed;
+  };
+
+  const generateNovelDirectory = async ({
+    config,
+    context,
+    plan,
+    threadId,
+    messageId,
+    userRequest,
+    planningGeneration,
+  }: {
+    config: ModelConfig;
+    context: WritableContext;
+    plan: NovelDirectoryPlan;
+    threadId: string;
+    messageId: string;
+    userRequest: string;
+    planningGeneration: ActiveGeneration;
+  }) => {
+    const directoryName = createAvailableDirectoryName(
+      normalizeDirectoryName(plan.directoryName),
+      context.project.resources,
+    );
+    const resolvedPlan = { ...plan, directoryName };
+    const summaryIntent: TextArtifactIntent = {
+      category: "原著",
+      title: resolvedPlan.title,
+      fileName: `${directoryName}/${resolvedPlan.summaryFileName}`,
+      displayName: resolvedPlan.summaryFileName,
+      folder: directoryName,
+      artifactRole: "summary",
+      operation: "create",
+    };
+    let summaryArtifact: ActiveTextArtifact;
+    try {
+      summaryArtifact = await prepareTextArtifact(
+        context,
+        summaryIntent,
+      );
+      planningGeneration.artifact = summaryArtifact;
+      await queueTextArtifactWrite(
+        summaryArtifact,
+        buildNovelOverviewMarkdown(resolvedPlan),
+        "ready",
+      );
+    } catch (error) {
+      activeGenerationRef.current = null;
+      setStreamingMessage(null);
+      setIsResponding(false);
+      updateThread(threadId, (thread) => ({
+        ...thread,
+        messages: [
+          ...thread.messages,
+          createMessage(
+            "system",
+            `无法创建小说目录与总览文件：${String(error)}`,
+          ),
+        ],
+      }));
+      return false;
+    }
+
+    const chapterOutline = resolvedPlan.chapters
+      .map(
+        (chapter, index) =>
+          `${index + 1}. ${chapter.title}：${chapter.brief}`,
+      )
+      .join("\n");
+    const completedChapters: Array<{
+      fileName: string;
+      characters: number;
+    }> = [];
+    let previousEnding = "";
+
+    for (const [index, chapter] of resolvedPlan.chapters.entries()) {
+      if (!activeGenerationRef.current) return false;
+      const chapterIntent: TextArtifactIntent = {
+        category: "原著",
+        title: chapter.title,
+        fileName: `${directoryName}/${chapter.fileName}`,
+        displayName: chapter.fileName,
+        folder: directoryName,
+        artifactRole: "chapter",
+        sequenceIndex: index + 1,
+        sequenceTotal: resolvedPlan.chapters.length,
+        operation: "create",
+      };
+      let artifact: ActiveTextArtifact;
+      try {
+        artifact = await prepareTextArtifact(context, chapterIntent);
+      } catch (error) {
+        activeGenerationRef.current = null;
+        setStreamingMessage(null);
+        setIsResponding(false);
+        updateThread(threadId, (thread) => ({
+          ...thread,
+          messages: [
+            ...thread.messages,
+            createMessage(
+              "system",
+              `无法创建第 ${index + 1} 章文件：${String(error)}`,
+            ),
+          ],
+        }));
+        return false;
+      }
+
+      const requestId = createId();
+      const active: ActiveGeneration = {
+        requestId,
+        threadId,
+        messageId,
+        content: "",
+        cancelled: false,
+        artifact,
+      };
+      activeGenerationRef.current = active;
+      showArtifactProgress(active, "writing");
+
+      try {
+        const completed = await streamArtifactContent(
+          config,
+          active,
+          `用户的原始创作要求：\n${userRequest}\n\n作品名：${
+            resolvedPlan.title
+          }\n全书梗概：${resolvedPlan.overview}\n\n完整章节规划：\n${
+            chapterOutline
+          }\n\n本次只创作第 ${index + 1} 章《${
+            chapter.title
+          }》。\n本章剧情目标：${chapter.brief}${
+            previousEnding
+              ? `\n\n上一章结尾（用于保持连续性）：\n${previousEnding}`
+              : ""
+          }`,
+          `你是专业中文长篇小说作者，正在分章节编辑项目文件。只输出第 ${
+            index + 1
+          } 章《${chapter.title}》的 Markdown 正文。\n- 正文目标 2500 至 4000 个中文字符，必须有完整场景、人物行动、冲突推进和章末钩子。\n- 第一行使用“# 第 ${
+            index + 1
+          } 章 ${chapter.title}”。\n- 严格遵循全书规划，并与上一章自然衔接。\n- 不输出创作说明、章节小结、保存提示、代码围栏或下一章内容。`,
+        );
+        if (!completed) return false;
+        if (!completed.content.trim()) {
+          throw new Error("模型没有返回章节正文");
+        }
+        completed.finalizing = true;
+        showArtifactProgress(completed, "saving");
+        await queueTextArtifactWrite(
+          artifact,
+          completed.content,
+          "ready",
+        );
+        completedChapters.push({
+          fileName: chapter.fileName,
+          characters: completed.content.length,
+        });
+        previousEnding = completed.content.slice(-2200);
+        await queueTextArtifactWrite(
+          summaryArtifact,
+          buildNovelOverviewMarkdown(
+            resolvedPlan,
+            completedChapters,
+          ),
+          "ready",
+        );
+      } catch (error) {
+        const failed = activeGenerationRef.current;
+        clearArtifactCheckpoint(failed?.artifact);
+        if (failed?.content.trim()) {
+          try {
+            await queueTextArtifactWrite(
+              artifact,
+              failed.content,
+              "error",
+            );
+          } catch {
+            updateProject(context.project.id, (project) => ({
+              ...project,
+              resources: project.resources.map((resource) =>
+                resource.id === artifact.resource.id
+                  ? { ...resource, status: "error" }
+                  : resource,
+              ),
+            }));
+          }
+        }
+        activeGenerationRef.current = null;
+        setStreamingMessage(null);
+        setIsResponding(false);
+        updateThread(threadId, (thread) => ({
+          ...thread,
+          messages: [
+            ...thread.messages,
+            createMessage(
+              "system",
+              `小说目录已保留，但第 ${index + 1} 章生成中断：${String(
+                error,
+              )}`,
+              [
+                {
+                  type: "open-resource",
+                  resourceId: artifact.resource.id,
+                  label: "查看中断章节",
+                },
+              ],
+            ),
+          ],
+        }));
+        return false;
+      }
+    }
+
+    const totalCharacters = completedChapters.reduce(
+      (total, chapter) => total + chapter.characters,
+      0,
+    );
+    activeGenerationRef.current = null;
+    setStreamingMessage(null);
+    setIsResponding(false);
+    updateThread(threadId, (thread) => ({
+      ...thread,
+      updatedAt: Date.now(),
+      messages: [
+        ...thread.messages,
+        createMessage(
+          "assistant",
+          `小说《${resolvedPlan.title}》已经生成到目录 **${directoryName}**，共 ${resolvedPlan.chapters.length} 章、${totalCharacters.toLocaleString()} 字。作品总览中包含章节目录、剧情小结和完成进度。`,
+          [
+            {
+              type: "open-resource",
+              resourceId: summaryArtifact.resource.id,
+              label: "查看作品总览",
+            },
+          ],
+        ),
+      ],
+    }));
+    setSelectedResourceId(summaryArtifact.resource.id);
+    setRightTab("files");
+    setRightOpen(true);
+    setToast(`《${resolvedPlan.title}》全部章节已写入作品目录`);
+    return true;
   };
 
   const sendMessage = async () => {
@@ -2062,6 +2524,7 @@ function App() {
     setIsResponding(true);
 
     let plannedIntent = artifactIntent;
+    let novelDirectoryPlan: NovelDirectoryPlan | undefined;
     let conversationTitle = thread.title;
     const needsArtifactName = Boolean(
       artifactIntent &&
@@ -2084,7 +2547,7 @@ function App() {
           ? {
               artifactStatus: {
                 phase: "planning" as const,
-                fileName: "正在规划小说标题与文件名",
+                fileName: "正在规划作品目录与章节",
                 generatedCharacters: 0,
                 persistedCharacters: 0,
               },
@@ -2106,17 +2569,8 @@ function App() {
         if (thread.title === "新任务") {
           conversationTitle = plan.conversationTitle;
         }
-        if (
-          needsArtifactName &&
-          artifactIntent &&
-          plan.artifactTitle &&
-          plan.fileName
-        ) {
-          plannedIntent = {
-            ...artifactIntent,
-            title: plan.artifactTitle,
-            fileName: plan.fileName,
-          };
+        if (needsArtifactName && artifactIntent && plan.novel) {
+          novelDirectoryPlan = plan.novel;
         }
         setWorkspace((current) => ({
           ...current,
@@ -2162,6 +2616,19 @@ function App() {
         }));
         return;
       }
+    }
+
+    if (novelDirectoryPlan && writableContext) {
+      await generateNovelDirectory({
+        config,
+        context: writableContext,
+        plan: novelDirectoryPlan,
+        threadId,
+        messageId,
+        userRequest: input,
+        planningGeneration,
+      });
+      return;
     }
 
     let activeArtifact: ActiveTextArtifact | undefined;
@@ -4106,7 +4573,7 @@ function ChatView({
                       <Sparkles size={16} />
                       <span>
                         <strong>AI 创作小说</strong>
-                        <small>根据构想生成可编辑草稿</small>
+                        <small>通过对话规划目录、章节与小结</small>
                       </span>
                     </button>
                     <button
@@ -4205,15 +4672,19 @@ function ArtifactEditingStatus({
       <span className="artifact-editing-copy">
         <strong>
           {isPlanning
-            ? "正在规划作品与文件名"
+            ? "正在规划作品目录与章节"
             : isSaving
               ? `正在完成写入：${status.fileName}`
               : `正在编辑：${status.fileName}`}
         </strong>
         <small>
           {isPlanning
-            ? "由对话模型生成任务标题、作品名和 Markdown 文件名"
-            : `已生成 ${status.generatedCharacters.toLocaleString()} 字 · 已写入 ${status.persistedCharacters.toLocaleString()} 字`}
+            ? "由对话模型规划任务标题、作品目录、章节与剧情小结"
+            : `${
+                status.sequenceIndex && status.sequenceTotal
+                  ? `第 ${status.sequenceIndex}/${status.sequenceTotal} 章 · `
+                  : ""
+              }已生成 ${status.generatedCharacters.toLocaleString()} 字 · 已写入 ${status.persistedCharacters.toLocaleString()} 字`}
         </small>
       </span>
       <span className="artifact-editing-activity" aria-hidden="true">
@@ -5259,6 +5730,64 @@ function ResourceGroup({
   onSelect: (id: string) => void;
 }) {
   const [open, setOpen] = useState(true);
+  const [closedFolders, setClosedFolders] = useState<string[]>([]);
+  const folders = useMemo(() => {
+    const grouped = new Map<string, ProjectResource[]>();
+    const loose: ProjectResource[] = [];
+    items.forEach((resource) => {
+      if (!resource.folder) {
+        loose.push(resource);
+        return;
+      }
+      grouped.set(resource.folder, [
+        ...(grouped.get(resource.folder) ?? []),
+        resource,
+      ]);
+    });
+    return {
+      loose,
+      grouped: [...grouped.entries()].map(([name, resources]) => ({
+        name,
+        resources: [...resources].sort((left, right) =>
+          left.name.localeCompare(right.name, "zh-CN", {
+            numeric: true,
+          }),
+        ),
+      })),
+    };
+  }, [items]);
+
+  const renderResource = (resource: ProjectResource) => (
+    <button
+      key={resource.id}
+      className={
+        selectedResourceId === resource.id ? "selected" : ""
+      }
+      onClick={() => onSelect(resource.id)}
+    >
+      {resource.kind === "video" ? (
+        <Film size={14} />
+      ) : resource.kind === "image" ? (
+        <ImageIcon size={14} />
+      ) : (
+        <File size={14} />
+      )}
+      <span>{resource.name}</span>
+      {resource.status === "generating" ? (
+        <small className="resource-status generating">
+          <RotateCcw size={10} className="spin" />
+          写入中
+        </small>
+      ) : resource.status === "stopped" ? (
+        <small className="resource-status stopped">草稿</small>
+      ) : resource.status === "error" ? (
+        <small className="resource-status error">写入异常</small>
+      ) : resource.size ? (
+        <small>{formatBytes(resource.size)}</small>
+      ) : null}
+    </button>
+  );
+
   return (
     <div className="resource-group">
       <button
@@ -5272,36 +5801,46 @@ function ResourceGroup({
       </button>
       <div className={`resource-items-collapse ${open ? "open" : ""}`}>
         <div className="resource-items">
-          {items.map((resource) => (
-            <button
-              key={resource.id}
-              className={
-                selectedResourceId === resource.id ? "selected" : ""
-              }
-              onClick={() => onSelect(resource.id)}
-            >
-              {resource.kind === "video" ? (
-                <Film size={14} />
-              ) : resource.kind === "image" ? (
-                <ImageIcon size={14} />
-              ) : (
-                <File size={14} />
-              )}
-              <span>{resource.name}</span>
-              {resource.status === "generating" ? (
-                <small className="resource-status generating">
-                  <RotateCcw size={10} className="spin" />
-                  写入中
-                </small>
-              ) : resource.status === "stopped" ? (
-                <small className="resource-status stopped">草稿</small>
-              ) : resource.status === "error" ? (
-                <small className="resource-status error">写入异常</small>
-              ) : resource.size ? (
-                <small>{formatBytes(resource.size)}</small>
-              ) : null}
-            </button>
-          ))}
+          {folders.grouped.map((folder) => {
+            const folderOpen = !closedFolders.includes(folder.name);
+            return (
+              <div className="resource-folder" key={folder.name}>
+                <button
+                  type="button"
+                  className="resource-folder-row"
+                  onClick={() =>
+                    setClosedFolders((current) =>
+                      current.includes(folder.name)
+                        ? current.filter((name) => name !== folder.name)
+                        : [...current, folder.name],
+                    )
+                  }
+                >
+                  <ChevronRight
+                    size={12}
+                    className={folderOpen ? "open" : ""}
+                  />
+                  {folderOpen ? (
+                    <FolderOpen size={14} />
+                  ) : (
+                    <Folder size={14} />
+                  )}
+                  <span>{folder.name}</span>
+                  <small>{folder.resources.length}</small>
+                </button>
+                <div
+                  className={`resource-folder-files ${
+                    folderOpen ? "open" : ""
+                  }`}
+                  aria-hidden={!folderOpen}
+                  inert={!folderOpen}
+                >
+                  {folder.resources.map(renderResource)}
+                </div>
+              </div>
+            );
+          })}
+          {folders.loose.map(renderResource)}
         </div>
       </div>
     </div>
@@ -5938,6 +6477,9 @@ function ResourcePreview({
 }) {
   const editable =
     resource.kind === "text" && resource.category === "原著";
+  const [viewMode, setViewMode] = useState<"preview" | "edit">(
+    "preview",
+  );
   const [content, setContent] = useState(resource.preview ?? "");
   const [savedContent, setSavedContent] = useState(
     resource.preview ?? "",
@@ -5950,6 +6492,14 @@ function ResourcePreview({
     useState(false);
   const dirty = editable && content !== savedContent;
   const agentWriting = resource.status === "generating";
+
+  useEffect(() => {
+    setViewMode("preview");
+  }, [resource.id]);
+
+  useEffect(() => {
+    if (agentWriting) setViewMode("preview");
+  }, [agentWriting]);
 
   useEffect(() => {
     if (!editable) return;
@@ -6032,19 +6582,48 @@ function ResourcePreview({
           </div>
           <div className="resource-editor-actions">
             {editable && (
-              <button
-                type="button"
-                className="secondary-button compact-button"
-                onClick={() => void saveChanges()}
-                disabled={loading || saving || agentWriting || !dirty}
-              >
-                {saving ? (
-                  <RotateCcw size={13} className="spin" />
-                ) : (
-                  <Save size={14} />
+              <>
+                <div
+                  className="resource-view-switch"
+                  role="tablist"
+                  aria-label="文件查看方式"
+                >
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={viewMode === "preview"}
+                    className={viewMode === "preview" ? "active" : ""}
+                    onClick={() => setViewMode("preview")}
+                  >
+                    预览
+                  </button>
+                  <button
+                    type="button"
+                    role="tab"
+                    aria-selected={viewMode === "edit"}
+                    className={viewMode === "edit" ? "active" : ""}
+                    onClick={() => setViewMode("edit")}
+                    disabled={agentWriting}
+                  >
+                    编辑
+                  </button>
+                </div>
+                {viewMode === "edit" && (
+                  <button
+                    type="button"
+                    className="secondary-button compact-button"
+                    onClick={() => void saveChanges()}
+                    disabled={loading || saving || agentWriting || !dirty}
+                  >
+                    {saving ? (
+                      <RotateCcw size={13} className="spin" />
+                    ) : (
+                      <Save size={14} />
+                    )}
+                    {saving ? "保存中" : "保存修改"}
+                  </button>
                 )}
-                {saving ? "保存中" : "保存修改"}
-              </button>
+              </>
             )}
             <button
               type="button"
@@ -6062,6 +6641,16 @@ function ResourcePreview({
               <div className="resource-editor-loading">
                 <RotateCcw size={18} className="spin" />
                 <span>正在读取原著全文</span>
+              </div>
+            ) : viewMode === "preview" ? (
+              <div className="resource-markdown-preview">
+                {content.trim() ? (
+                  <MarkdownMessage content={content} />
+                ) : (
+                  <span className="resource-preview-empty">
+                    文件内容为空
+                  </span>
+                )}
               </div>
             ) : (
               <div className="resource-editor-shell">
@@ -6092,7 +6681,15 @@ function ResourcePreview({
               </div>
             )
           ) : resource.kind === "text" ? (
-            <pre>{resource.preview || "文件内容为空"}</pre>
+            /\.md|\.markdown$/i.test(resource.name) ? (
+              <div className="resource-markdown-preview">
+                <MarkdownMessage
+                  content={resource.preview || "文件内容为空"}
+                />
+              </div>
+            ) : (
+              <pre>{resource.preview || "文件内容为空"}</pre>
+            )
           ) : (
             <div className="unavailable-preview">
               {resource.kind === "video" ? (

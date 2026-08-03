@@ -1,7 +1,7 @@
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
 use tauri::ipc::Channel;
@@ -36,6 +36,30 @@ fn provider_url(base_url: &str, path: &str) -> String {
         base_url.trim_end_matches('/'),
         path.trim_start_matches('/')
     )
+}
+
+fn safe_source_relative_path(value: &str) -> Result<PathBuf, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err("文件相对路径为空".into());
+    }
+    let path = Path::new(trimmed);
+    if path.is_absolute() {
+        return Err("文件路径必须位于项目 source 目录内".into());
+    }
+
+    let mut safe_path = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(segment) if !segment.is_empty() => safe_path.push(segment),
+            _ => return Err("文件路径包含不安全的目录层级".into()),
+        }
+    }
+    if safe_path.as_os_str().is_empty() {
+        Err("文件相对路径无效".into())
+    } else {
+        Ok(safe_path)
+    }
 }
 
 fn uses_anthropic_messages(provider: &str) -> bool {
@@ -635,10 +659,7 @@ async fn save_project_source(
         return Err("项目 ID 无效".into());
     }
 
-    let safe_file_name = Path::new(&file_name)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| "文件名无效".to_string())?;
+    let safe_relative_path = safe_source_relative_path(&file_name)?;
 
     let app_data_dir = app
         .path()
@@ -663,8 +684,11 @@ async fn save_project_source(
             .join("source")
     };
 
-    std::fs::create_dir_all(&project_dir).map_err(|error| format!("无法创建项目目录：{error}"))?;
-    let path = project_dir.join(safe_file_name);
+    let path = project_dir.join(safe_relative_path);
+    let parent = path
+        .parent()
+        .ok_or_else(|| "无法解析文件目录".to_string())?;
+    std::fs::create_dir_all(parent).map_err(|error| format!("无法创建项目目录：{error}"))?;
     std::fs::write(&path, content).map_err(|error| format!("无法保存文件：{error}"))?;
 
     Ok(path.to_string_lossy().into_owned())
@@ -726,10 +750,11 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        complete_response_text, is_terminal_sse_line, parse_sse_line, uses_kie_market,
-        KIE_SEEDREAM_MODELS,
+        complete_response_text, is_terminal_sse_line, parse_sse_line, safe_source_relative_path,
+        uses_kie_market, KIE_SEEDREAM_MODELS,
     };
     use serde_json::json;
+    use std::path::PathBuf;
 
     #[test]
     fn parses_openai_chat_completion_delta() {
@@ -766,6 +791,16 @@ mod tests {
         assert!(!is_terminal_sse_line(
             br#"data: {"choices":[{"delta":{"content":"x"}}]}"#
         ));
+    }
+
+    #[test]
+    fn accepts_only_safe_nested_source_paths() {
+        assert_eq!(
+            safe_source_relative_path("雾港回声/01-潮汐来信.md").unwrap(),
+            PathBuf::from("雾港回声").join("01-潮汐来信.md")
+        );
+        assert!(safe_source_relative_path("../secrets.md").is_err());
+        assert!(safe_source_relative_path("/absolute.md").is_err());
     }
 
     #[test]
