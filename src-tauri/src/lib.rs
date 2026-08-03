@@ -580,6 +580,29 @@ async fn save_project_source(
     Ok(path.to_string_lossy().into_owned())
 }
 
+#[tauri::command]
+async fn read_project_source(app: tauri::AppHandle, path: String) -> Result<String, String> {
+    if path.trim().is_empty() {
+        return Err("原著文件路径为空".into());
+    }
+
+    let source_root = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("无法获取应用数据目录：{error}"))?
+        .join("projects");
+    let canonical_root = std::fs::canonicalize(&source_root)
+        .map_err(|error| format!("无法访问项目资源目录：{error}"))?;
+    let canonical_path = std::fs::canonicalize(Path::new(&path))
+        .map_err(|error| format!("无法访问原著文件：{error}"))?;
+
+    if !canonical_path.starts_with(&canonical_root) {
+        return Err("拒绝读取项目资源目录之外的文件".into());
+    }
+
+    std::fs::read_to_string(&canonical_path).map_err(|error| format!("无法读取原著文件：{error}"))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -590,7 +613,8 @@ pub fn run() {
             list_provider_models,
             stream_chat_message,
             cancel_chat_generation,
-            save_project_source
+            save_project_source,
+            read_project_source
         ])
         .run(tauri::generate_context!())
         .expect("error while running Manju Agent");

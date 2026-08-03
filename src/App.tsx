@@ -35,6 +35,7 @@ import {
   Save,
   Search,
   Settings,
+  Sparkles,
   Square,
   SquarePen,
   Video,
@@ -98,6 +99,9 @@ type ActiveGeneration = {
   content: string;
   cancelled: boolean;
 };
+
+type NovelCreationMode = "ai" | "blank";
+type NovelGenerationMode = "plan" | "chapter" | "short";
 
 type Thread = {
   id: string;
@@ -369,6 +373,20 @@ function createMessage(
   };
 }
 
+function normalizeNovelFileName(title: string) {
+  const normalized = title
+    .trim()
+    .replace(/[<>:"/\\|?*\u0000-\u001f]/g, "-")
+    .replace(/[. ]+$/g, "") || "未命名小说";
+  return /\.(txt|md|markdown)$/i.test(normalized)
+    ? normalized
+    : `${normalized}.md`;
+}
+
+function textByteLength(content: string) {
+  return new TextEncoder().encode(content).byteLength;
+}
+
 function isModelConfigured(config: ModelConfig) {
   const apiKeyReady =
     config.provider.includes("自定义") ||
@@ -438,7 +456,7 @@ function buildAgentSystemPrompt(
 - 已有资源：${resourceSummary}
 
 必须遵循的制作顺序：
-1. 导入原著后先建立章节索引、故事设定和角色表，不要一次把整本小说塞进上下文。
+1. 导入或创作原著后先建立章节索引、故事设定和角色表，不要一次把整本小说塞进上下文。
 2. 按章节或场次拆解剧情，形成剧本、镜头目标和连续性约束。
 3. 角色设定、场景设定和分镜确认后，才进入生图环节，生成角色、场景、分镜等静态物料。
 4. 静态物料和镜头运动方案准备完成后，才进入视频环节；视频模型用于文生视频、图生视频、动态镜头和成片素材。
@@ -713,6 +731,8 @@ function App() {
   const [searchDialogOpen, setSearchDialogOpen] = useState(false);
   const [settingsDialogOpen, setSettingsDialogOpen] = useState(false);
   const [resourcePreviewOpen, setResourcePreviewOpen] = useState(false);
+  const [novelCreationMode, setNovelCreationMode] =
+    useState<NovelCreationMode | null>(null);
   const [toast, setToast] = useState("");
   const [testState, setTestState] = useState<{
     loading: boolean;
@@ -750,6 +770,7 @@ function App() {
   const activeGenerationRef = useRef<ActiveGeneration | null>(
     null,
   );
+  const novelGenerationRequestRef = useRef("");
   const pendingGuidanceRef = useRef(false);
 
   const clampLeftWidth = (
@@ -1098,6 +1119,226 @@ function App() {
     setRightTab("files");
     setRightOpen(true);
     setToast("原著已导入当前项目");
+  };
+
+  const openNovelCreator = (mode: NovelCreationMode) => {
+    if (!selectedProject) {
+      setToast("请先为当前任务选择项目文件夹");
+      return;
+    }
+    if (mode === "ai" && !isModelConfigured(modelConfigs.chat)) {
+      setActiveModelKind("chat");
+      setSettingsDialogOpen(true);
+      setToast("AI 创作小说前需要先配置对话模型");
+      return;
+    }
+    setNovelCreationMode(mode);
+  };
+
+  const generateNovelDraft = async (
+    title: string,
+    brief: string,
+    mode: NovelGenerationMode,
+    onDelta: (content: string) => void,
+  ) => {
+    const config = modelConfigs.chat;
+    if (!isModelConfigured(config)) {
+      throw new Error("请先配置可用的对话模型");
+    }
+    if (!brief.trim()) {
+      throw new Error("请先填写题材、人物或故事构想");
+    }
+
+    const modeInstruction: Record<NovelGenerationMode, string> = {
+      plan: "生成可继续扩写的小说方案，包括故事梗概、世界观、主要角色、核心矛盾和分章目录，不写无关说明。",
+      chapter:
+        "生成小说第一章草稿，约 3000 字。需要有明确场景、人物行动、冲突和章末钩子，只输出可编辑正文。",
+      short:
+        "生成结构完整的中文短篇小说，约 6000 字。保证开端、发展、转折和结局完整，只输出可编辑正文。",
+    };
+    const requestId = createId();
+    novelGenerationRequestRef.current = requestId;
+    let content = "";
+
+    try {
+      const { Channel, invoke } = await import(
+        "@tauri-apps/api/core"
+      );
+      const onEvent = new Channel<ChatStreamEvent>();
+      let settleStream: () => void = () => undefined;
+      const streamSettled = new Promise<void>((resolve) => {
+        settleStream = resolve;
+      });
+      onEvent.onmessage = (event) => {
+        if (
+          event.event === "finished" ||
+          event.event === "cancelled"
+        ) {
+          settleStream();
+        }
+        if (
+          event.event !== "delta" ||
+          !event.data ||
+          novelGenerationRequestRef.current !== requestId
+        ) {
+          return;
+        }
+        content += event.data;
+        onDelta(content);
+      };
+
+      await invoke<void>("stream_chat_message", {
+        requestId,
+        provider: config.provider,
+        baseUrl: config.baseUrl,
+        apiKey: config.apiKey,
+        model: config.model,
+        apiPath: config.apiPath,
+        headersJson: config.headers,
+        input: `小说标题：${title.trim() || "未命名"}\n\n创作要求：\n${brief.trim()}\n\n${modeInstruction[mode]}`,
+        systemPrompt:
+          "你是专业中文小说作者和剧本开发编辑。内容必须原创、人物动机清楚、叙事连贯。不要输出对话式解释、免责声明或 Markdown 代码围栏。",
+        onEvent,
+      });
+      await streamSettled;
+
+      if (novelGenerationRequestRef.current !== requestId) {
+        throw new Error("AI 创作已取消");
+      }
+      novelGenerationRequestRef.current = "";
+      if (!content.trim()) throw new Error("模型没有返回小说内容");
+      return content;
+    } catch (error) {
+      if (novelGenerationRequestRef.current === requestId) {
+        novelGenerationRequestRef.current = "";
+      }
+      throw error;
+    }
+  };
+
+  const cancelNovelGeneration = () => {
+    const requestId = novelGenerationRequestRef.current;
+    if (!requestId) return;
+    novelGenerationRequestRef.current = "";
+    void import("@tauri-apps/api/core")
+      .then(({ invoke }) =>
+        invoke<boolean>("cancel_chat_generation", { requestId }),
+      )
+      .catch(() => undefined);
+  };
+
+  const saveCreatedNovel = async (
+    title: string,
+    content: string,
+    source: NovelCreationMode,
+  ) => {
+    if (!selectedProject) {
+      throw new Error("当前任务尚未绑定项目文件夹");
+    }
+    if (!content.trim()) throw new Error("小说内容不能为空");
+
+    const fileName = normalizeNovelFileName(title);
+    const { invoke } = await import("@tauri-apps/api/core");
+    const savedPath = await invoke<string>("save_project_source", {
+      projectId: selectedProject.id,
+      fileName,
+      content,
+    });
+    const existing = selectedProject.resources.find(
+      (resource) =>
+        resource.category === "原著" && resource.name === fileName,
+    );
+    const resource: ProjectResource = {
+      id: existing?.id ?? createId(),
+      name: fileName,
+      category: "原著",
+      kind: "text",
+      size: textByteLength(content),
+      path: savedPath,
+      preview: content.slice(0, 12000),
+      createdAt: existing?.createdAt ?? Date.now(),
+    };
+
+    updateProject(selectedProject.id, (project) => ({
+      ...project,
+      updatedAt: Date.now(),
+      resources: [
+        resource,
+        ...project.resources.filter(
+          (item) => item.id !== resource.id,
+        ),
+      ],
+    }));
+    if (selectedThread) {
+      updateThread(selectedThread.id, (thread) => ({
+        ...thread,
+        updatedAt: Date.now(),
+        messages: [
+          ...thread.messages,
+          createMessage(
+            "system",
+            `${source === "ai" ? "AI 小说草稿" : "空白小说"}「${fileName}」已保存为原著资源，共 ${content.length.toLocaleString()} 个字符。`,
+          ),
+        ],
+      }));
+    }
+    setSelectedResourceId(resource.id);
+    setRightTab("files");
+    setRightOpen(true);
+    setNovelCreationMode(null);
+    setToast("小说已保存，可随时继续编辑");
+  };
+
+  const loadResourceContent = async (resource: ProjectResource) => {
+    if (!resource.path) return resource.preview ?? "";
+    const { invoke } = await import("@tauri-apps/api/core");
+    return invoke<string>("read_project_source", {
+      path: resource.path,
+    });
+  };
+
+  const saveResourceContent = async (
+    resource: ProjectResource,
+    content: string,
+  ) => {
+    if (!selectedProject) {
+      throw new Error("当前任务尚未绑定项目文件夹");
+    }
+    if (!content.trim()) throw new Error("原著内容不能为空");
+    const { invoke } = await import("@tauri-apps/api/core");
+    const savedPath = await invoke<string>("save_project_source", {
+      projectId: selectedProject.id,
+      fileName: resource.name,
+      content,
+    });
+    updateProject(selectedProject.id, (project) => ({
+      ...project,
+      updatedAt: Date.now(),
+      resources: project.resources.map((item) =>
+        item.id === resource.id
+          ? {
+              ...item,
+              path: savedPath,
+              size: textByteLength(content),
+              preview: content.slice(0, 12000),
+            }
+          : item,
+      ),
+    }));
+    if (selectedThread) {
+      updateThread(selectedThread.id, (thread) => ({
+        ...thread,
+        updatedAt: Date.now(),
+        messages: [
+          ...thread.messages,
+          createMessage(
+            "system",
+            `已保存对原著「${resource.name}」的修改。后续章节与角色索引应以最新版本为准。`,
+          ),
+        ],
+      }));
+    }
+    setToast("原著修改已保存");
   };
 
   const sendMessage = async () => {
@@ -1609,7 +1850,15 @@ function App() {
             onStop={stopGeneration}
             onInterruptAndSend={interruptAndSendGuidance}
             onChooseFolder={() => void chooseProjectFolder()}
-            onImport={() => fileInputRef.current?.click()}
+            onImport={() => {
+              if (!selectedProject) {
+                setToast("请先为当前任务选择项目文件夹");
+                return;
+              }
+              fileInputRef.current?.click();
+            }}
+            onCreateAiNovel={() => openNovelCreator("ai")}
+            onCreateBlankNovel={() => openNovelCreator("blank")}
             onOpenSettings={() => {
               setActiveModelKind("chat");
               setSettingsDialogOpen(true);
@@ -1698,10 +1947,26 @@ function App() {
         />
       )}
 
+      {novelCreationMode && selectedProject && (
+        <NovelCreatorDialog
+          mode={novelCreationMode}
+          projectName={selectedProject.name}
+          onClose={() => {
+            cancelNovelGeneration();
+            setNovelCreationMode(null);
+          }}
+          onGenerate={generateNovelDraft}
+          onCancelGeneration={cancelNovelGeneration}
+          onSave={saveCreatedNovel}
+        />
+      )}
+
       {resourcePreviewOpen && selectedResource && (
         <ResourcePreview
           resource={selectedResource}
           onClose={() => setResourcePreviewOpen(false)}
+          onLoad={loadResourceContent}
+          onSave={saveResourceContent}
         />
       )}
 
@@ -2298,6 +2563,8 @@ function ChatView({
   onInterruptAndSend,
   onChooseFolder,
   onImport,
+  onCreateAiNovel,
+  onCreateBlankNovel,
   onOpenSettings,
   onSelectModel,
   onConfigureModel,
@@ -2319,6 +2586,8 @@ function ChatView({
   onInterruptAndSend: () => void;
   onChooseFolder: () => void;
   onImport: () => void;
+  onCreateAiNovel: () => void;
+  onCreateBlankNovel: () => void;
   onOpenSettings: () => void;
   onSelectModel: (model: string) => void;
   onConfigureModel: (kind: ModelKind) => void;
@@ -2328,11 +2597,31 @@ function ChatView({
   const followOutputRef = useRef(true);
   const previousThreadIdRef = useRef(thread?.id ?? "");
   const previousRespondingRef = useRef(false);
+  const sourceMenuRef = useRef<HTMLDivElement>(null);
   const [followingOutput, setFollowingOutput] = useState(true);
+  const [sourceMenuOpen, setSourceMenuOpen] = useState(false);
   const activeStreamingMessage =
     streamingMessage?.threadId === thread?.id
       ? streamingMessage
       : null;
+
+  useEffect(() => {
+    if (!sourceMenuOpen) return;
+    const handlePointerDown = (event: PointerEvent) => {
+      if (!sourceMenuRef.current?.contains(event.target as Node)) {
+        setSourceMenuOpen(false);
+      }
+    };
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setSourceMenuOpen(false);
+    };
+    document.addEventListener("pointerdown", handlePointerDown);
+    window.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.removeEventListener("pointerdown", handlePointerDown);
+      window.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [sourceMenuOpen]);
 
   const scrollToBottom = (behavior: ScrollBehavior = "auto") => {
     const container = chatScrollRef.current;
@@ -2410,6 +2699,8 @@ function ChatView({
             project={project}
             onChooseFolder={onChooseFolder}
             onImport={onImport}
+            onCreateAiNovel={onCreateAiNovel}
+            onCreateBlankNovel={onCreateBlankNovel}
             onOpenSettings={onOpenSettings}
           />
         ) : (
@@ -2562,13 +2853,77 @@ function ChatView({
             />
             <div className="composer-toolbar">
               <div>
-                <button
-                  className="round-button composer-add-button"
-                  onClick={onImport}
-                  aria-label="添加文件"
+                <div
+                  ref={sourceMenuRef}
+                  className={`composer-source-picker ${
+                    sourceMenuOpen ? "open" : ""
+                  }`}
                 >
-                  <Plus size={18} />
-                </button>
+                  <button
+                    type="button"
+                    className="round-button composer-add-button"
+                    onClick={() =>
+                      setSourceMenuOpen((current) => !current)
+                    }
+                    aria-label="添加原著资源"
+                    aria-haspopup="menu"
+                    aria-expanded={sourceMenuOpen}
+                  >
+                    <Plus size={18} />
+                  </button>
+                  <div
+                    className="composer-source-menu ui-popover"
+                    role="menu"
+                    aria-label="添加原著资源"
+                    aria-hidden={!sourceMenuOpen}
+                  >
+                    <button
+                      type="button"
+                      role="menuitem"
+                      tabIndex={sourceMenuOpen ? 0 : -1}
+                      onClick={() => {
+                        setSourceMenuOpen(false);
+                        onCreateAiNovel();
+                      }}
+                    >
+                      <Sparkles size={16} />
+                      <span>
+                        <strong>AI 创作小说</strong>
+                        <small>根据构想生成可编辑草稿</small>
+                      </span>
+                    </button>
+                    <button
+                      type="button"
+                      role="menuitem"
+                      tabIndex={sourceMenuOpen ? 0 : -1}
+                      onClick={() => {
+                        setSourceMenuOpen(false);
+                        onImport();
+                      }}
+                    >
+                      <FileUp size={16} />
+                      <span>
+                        <strong>导入本地小说</strong>
+                        <small>支持 TXT、MD、Markdown</small>
+                      </span>
+                    </button>
+                    <button
+                      type="button"
+                      role="menuitem"
+                      tabIndex={sourceMenuOpen ? 0 : -1}
+                      onClick={() => {
+                        setSourceMenuOpen(false);
+                        onCreateBlankNovel();
+                      }}
+                    >
+                      <SquarePen size={16} />
+                      <span>
+                        <strong>新建空白小说</strong>
+                        <small>从空白正文开始编辑</small>
+                      </span>
+                    </button>
+                  </div>
+                </div>
                 <button
                   className={`access-status ${
                     project ? "granted" : ""
@@ -2622,11 +2977,15 @@ function EmptyTask({
   project,
   onChooseFolder,
   onImport,
+  onCreateAiNovel,
+  onCreateBlankNovel,
   onOpenSettings,
 }: {
   project: Project | null;
   onChooseFolder: () => void;
   onImport: () => void;
+  onCreateAiNovel: () => void;
+  onCreateBlankNovel: () => void;
   onOpenSettings: () => void;
 }) {
   return (
@@ -2649,10 +3008,26 @@ function EmptyTask({
           {project ? "更换文件夹" : "选择项目文件夹"}
         </button>
         {project && (
-          <button className="secondary-button" onClick={onImport}>
-            <FileUp size={15} />
-            导入小说
-          </button>
+          <>
+            <button
+              className="primary-button"
+              onClick={onCreateAiNovel}
+            >
+              <Sparkles size={15} />
+              AI 创作小说
+            </button>
+            <button className="secondary-button" onClick={onImport}>
+              <FileUp size={15} />
+              导入小说
+            </button>
+            <button
+              className="secondary-button"
+              onClick={onCreateBlankNovel}
+            >
+              <SquarePen size={15} />
+              新建空白
+            </button>
+          </>
         )}
         <button className="secondary-button" onClick={onOpenSettings}>
           <Settings size={15} />
@@ -3886,19 +4261,365 @@ function WorkspaceSearchDialog({
   );
 }
 
+function NovelCreatorDialog({
+  mode,
+  projectName,
+  onClose,
+  onGenerate,
+  onCancelGeneration,
+  onSave,
+}: {
+  mode: NovelCreationMode;
+  projectName: string;
+  onClose: () => void;
+  onGenerate: (
+    title: string,
+    brief: string,
+    mode: NovelGenerationMode,
+    onDelta: (content: string) => void,
+  ) => Promise<string>;
+  onCancelGeneration: () => void;
+  onSave: (
+    title: string,
+    content: string,
+    source: NovelCreationMode,
+  ) => Promise<void>;
+}) {
+  const generationOptions = [
+    "小说方案与目录",
+    "第一章草稿",
+    "完整短篇小说",
+  ];
+  const generationModeByLabel: Record<
+    string,
+    NovelGenerationMode
+  > = {
+    小说方案与目录: "plan",
+    第一章草稿: "chapter",
+    完整短篇小说: "short",
+  };
+  const [title, setTitle] = useState(
+    mode === "blank" ? "未命名小说" : "",
+  );
+  const [brief, setBrief] = useState("");
+  const [generationLabel, setGenerationLabel] = useState(
+    "小说方案与目录",
+  );
+  const [content, setContent] = useState("");
+  const [generating, setGenerating] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [touched, setTouched] = useState(false);
+  const [error, setError] = useState("");
+  const [closing, setClosing] = useState(false);
+  const [discardConfirmOpen, setDiscardConfirmOpen] =
+    useState(false);
+
+  const closeImmediately = () => {
+    if (closing) return;
+    onCancelGeneration();
+    setClosing(true);
+    window.setTimeout(onClose, 180);
+  };
+  const requestClose = () => {
+    if (touched || content.trim() || brief.trim()) {
+      setDiscardConfirmOpen(true);
+      return;
+    }
+    closeImmediately();
+  };
+  const startGeneration = async () => {
+    if (!brief.trim()) {
+      setError("请先填写题材、人物或故事构想");
+      return;
+    }
+    setGenerating(true);
+    setTouched(true);
+    setError("");
+    setContent("");
+    try {
+      await onGenerate(
+        title,
+        brief,
+        generationModeByLabel[generationLabel],
+        setContent,
+      );
+    } catch (generationError) {
+      const message = String(generationError);
+      if (!message.includes("已取消")) setError(message);
+    } finally {
+      setGenerating(false);
+    }
+  };
+  const saveNovel = async () => {
+    if (!content.trim()) {
+      setError("小说正文不能为空");
+      return;
+    }
+    setSaving(true);
+    setError("");
+    try {
+      await onSave(title, content, mode);
+    } catch (saveError) {
+      setError(String(saveError));
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div
+      className={`modal-backdrop ${closing ? "closing" : ""}`}
+      onMouseDown={requestClose}
+    >
+      <section
+        className="novel-creator-dialog ui-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-label={mode === "ai" ? "AI 创作小说" : "新建空白小说"}
+        onMouseDown={(event) => event.stopPropagation()}
+      >
+        <header>
+          <div>
+            <strong>
+              {mode === "ai" ? "AI 创作小说" : "新建空白小说"}
+            </strong>
+            <span>保存到「{projectName}」的原著资源</span>
+          </div>
+          <button
+            type="button"
+            className="icon-button"
+            onClick={requestClose}
+            aria-label="关闭小说编辑器"
+          >
+            <X size={17} />
+          </button>
+        </header>
+
+        <div className="novel-creator-body">
+          <div className={`novel-creator-fields ${mode}`}>
+            <label className="field">
+              <span>小说标题</span>
+              <input
+                value={title}
+                placeholder="例如：雾港来信"
+                onChange={(event) => {
+                  setTitle(event.target.value);
+                  setTouched(true);
+                }}
+              />
+            </label>
+            {mode === "ai" && (
+              <div className="field">
+                <span>生成内容</span>
+                <CustomSelect
+                  label="生成内容"
+                  value={generationLabel}
+                  options={generationOptions}
+                  onChange={setGenerationLabel}
+                />
+              </div>
+            )}
+          </div>
+
+          {mode === "ai" && (
+            <label className="field novel-brief-field">
+              <span>创作要求</span>
+              <textarea
+                rows={4}
+                value={brief}
+                placeholder="描述题材、时代背景、主要人物、核心冲突、叙事风格和你不希望出现的内容……"
+                onChange={(event) => {
+                  setBrief(event.target.value);
+                  setTouched(true);
+                }}
+                disabled={generating}
+              />
+            </label>
+          )}
+
+          <div className="novel-editor-heading">
+            <div>
+              <strong>{mode === "ai" ? "生成草稿" : "小说正文"}</strong>
+              <span>{content.length.toLocaleString()} 个字符</span>
+            </div>
+            {generating && (
+              <span className="novel-generating-status">
+                <RotateCcw size={13} className="spin" />
+                AI 正在创作
+              </span>
+            )}
+          </div>
+          <textarea
+            className="novel-editor-textarea"
+            value={content}
+            placeholder={
+              mode === "ai"
+                ? "填写创作要求后生成，生成结果可在这里继续修改。"
+                : "从这里开始写小说……"
+            }
+            onChange={(event) => {
+              setContent(event.target.value);
+              setTouched(true);
+            }}
+            disabled={generating}
+            spellCheck={false}
+          />
+          {error && (
+            <div className="editor-error" role="alert">
+              <AlertCircle size={14} />
+              <span>{error}</span>
+            </div>
+          )}
+        </div>
+
+        <footer>
+          <span>保存后可在右侧“原著”分类继续编辑</span>
+          <div>
+            {mode === "ai" && (
+              <button
+                type="button"
+                className="secondary-button"
+                onClick={
+                  generating
+                    ? () => {
+                        onCancelGeneration();
+                        setGenerating(false);
+                      }
+                    : () => void startGeneration()
+                }
+                disabled={saving}
+              >
+                {generating ? (
+                  <Square size={11} fill="currentColor" />
+                ) : (
+                  <Sparkles size={15} />
+                )}
+                {generating
+                  ? "停止生成"
+                  : content
+                    ? "重新生成"
+                    : "生成草稿"}
+              </button>
+            )}
+            <button
+              type="button"
+              className="primary-button"
+              onClick={() => void saveNovel()}
+              disabled={saving || generating || !content.trim()}
+            >
+              {saving ? (
+                <RotateCcw size={14} className="spin" />
+              ) : (
+                <Save size={15} />
+              )}
+              {saving ? "正在保存" : "保存小说"}
+            </button>
+          </div>
+        </footer>
+
+        {discardConfirmOpen && (
+          <div className="editor-confirm-layer">
+            <div className="editor-confirm-card" role="alertdialog">
+              <strong>放弃未保存的内容？</strong>
+              <span>关闭后，本次创作和修改不会保留。</span>
+              <div>
+                <button
+                  type="button"
+                  className="secondary-button"
+                  onClick={() => setDiscardConfirmOpen(false)}
+                >
+                  继续编辑
+                </button>
+                <button
+                  type="button"
+                  className="danger-button"
+                  onClick={closeImmediately}
+                >
+                  放弃内容
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+      </section>
+    </div>
+  );
+}
+
 function ResourcePreview({
   resource,
   onClose,
+  onLoad,
+  onSave,
 }: {
   resource: ProjectResource;
   onClose: () => void;
+  onLoad: (resource: ProjectResource) => Promise<string>;
+  onSave: (
+    resource: ProjectResource,
+    content: string,
+  ) => Promise<void>;
 }) {
+  const editable =
+    resource.kind === "text" && resource.category === "原著";
+  const [content, setContent] = useState(resource.preview ?? "");
+  const [savedContent, setSavedContent] = useState(
+    resource.preview ?? "",
+  );
+  const [loading, setLoading] = useState(editable);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
   const [closing, setClosing] = useState(false);
-  const requestClose = () => {
+  const [discardConfirmOpen, setDiscardConfirmOpen] =
+    useState(false);
+  const dirty = editable && content !== savedContent;
+
+  useEffect(() => {
+    if (!editable) return;
+    let active = true;
+    setLoading(true);
+    setError("");
+    void onLoad(resource)
+      .then((loadedContent) => {
+        if (!active) return;
+        setContent(loadedContent);
+        setSavedContent(loadedContent);
+      })
+      .catch((loadError) => {
+        if (active) setError(String(loadError));
+      })
+      .finally(() => {
+        if (active) setLoading(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [editable, resource.id, resource.path]);
+
+  const closeImmediately = () => {
     if (closing) return;
     setClosing(true);
     window.setTimeout(onClose, 180);
   };
+  const requestClose = () => {
+    if (dirty) {
+      setDiscardConfirmOpen(true);
+      return;
+    }
+    closeImmediately();
+  };
+  const saveChanges = async () => {
+    setSaving(true);
+    setError("");
+    try {
+      await onSave(resource, content);
+      setSavedContent(content);
+    } catch (saveError) {
+      setError(String(saveError));
+    } finally {
+      setSaving(false);
+    }
+  };
+
   return (
     <div
       className={`modal-backdrop ${closing ? "closing" : ""}`}
@@ -3908,7 +4629,7 @@ function ResourcePreview({
         className="resource-preview ui-dialog"
         role="dialog"
         aria-modal="true"
-        aria-label={`预览 ${resource.name}`}
+        aria-label={`${editable ? "编辑" : "预览"} ${resource.name}`}
         onMouseDown={(event) => event.stopPropagation()}
       >
         <header>
@@ -3917,14 +4638,64 @@ function ResourcePreview({
             <span>
               {resource.category}
               {resource.size ? ` · ${formatBytes(resource.size)}` : ""}
+              {editable ? " · 可编辑" : ""}
             </span>
           </div>
-          <button className="icon-button" onClick={requestClose}>
-            <X size={17} />
-          </button>
+          <div className="resource-editor-actions">
+            {editable && (
+              <button
+                type="button"
+                className="secondary-button compact-button"
+                onClick={() => void saveChanges()}
+                disabled={loading || saving || !dirty}
+              >
+                {saving ? (
+                  <RotateCcw size={13} className="spin" />
+                ) : (
+                  <Save size={14} />
+                )}
+                {saving ? "保存中" : "保存修改"}
+              </button>
+            )}
+            <button
+              type="button"
+              className="icon-button"
+              onClick={requestClose}
+              aria-label="关闭资源编辑器"
+            >
+              <X size={17} />
+            </button>
+          </div>
         </header>
         <div className="preview-body">
-          {resource.kind === "text" ? (
+          {editable ? (
+            loading ? (
+              <div className="resource-editor-loading">
+                <RotateCcw size={18} className="spin" />
+                <span>正在读取原著全文</span>
+              </div>
+            ) : (
+              <div className="resource-editor-shell">
+                <div className="resource-editor-meta">
+                  <span>{content.length.toLocaleString()} 个字符</span>
+                  <span>{dirty ? "有未保存修改" : "已保存"}</span>
+                </div>
+                <textarea
+                  className="resource-editor-textarea"
+                  value={content}
+                  onChange={(event) => setContent(event.target.value)}
+                  spellCheck={false}
+                  aria-label={`编辑 ${resource.name}`}
+                />
+                {error && (
+                  <div className="editor-error" role="alert">
+                    <AlertCircle size={14} />
+                    <span>{error}</span>
+                  </div>
+                )}
+              </div>
+            )
+          ) : resource.kind === "text" ? (
             <pre>{resource.preview || "文件内容为空"}</pre>
           ) : (
             <div className="unavailable-preview">
@@ -3937,6 +4708,31 @@ function ResourcePreview({
             </div>
           )}
         </div>
+
+        {discardConfirmOpen && (
+          <div className="editor-confirm-layer">
+            <div className="editor-confirm-card" role="alertdialog">
+              <strong>放弃未保存的修改？</strong>
+              <span>关闭后，本次对原著的调整不会保留。</span>
+              <div>
+                <button
+                  type="button"
+                  className="secondary-button"
+                  onClick={() => setDiscardConfirmOpen(false)}
+                >
+                  继续编辑
+                </button>
+                <button
+                  type="button"
+                  className="danger-button"
+                  onClick={closeImmediately}
+                >
+                  放弃修改
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
       </section>
     </div>
   );
