@@ -44,6 +44,7 @@ import {
   X,
 } from "lucide-react";
 import ReactMarkdown from "react-markdown";
+import { createPortal } from "react-dom";
 import remarkGfm from "remark-gfm";
 import type {
   CSSProperties,
@@ -2688,6 +2689,7 @@ function LeftSidebar({
       defaultSidebarPreferences,
     );
   const [brandMenuOpen, setBrandMenuOpen] = useState(false);
+  const [workspaceMenuOpen, setWorkspaceMenuOpen] = useState(false);
   const [threadMenu, setThreadMenu] = useState<{
     threadId: string;
     left: number;
@@ -2695,6 +2697,8 @@ function LeftSidebar({
   } | null>(null);
   const brandButtonRef = useRef<HTMLButtonElement>(null);
   const brandMenuRef = useRef<HTMLDivElement>(null);
+  const workspaceButtonRef = useRef<HTMLButtonElement>(null);
+  const workspaceMenuRef = useRef<HTMLDivElement>(null);
   const selectedThread = threads.find(
     (thread) => thread.id === selectedThreadId,
   );
@@ -2818,11 +2822,43 @@ function LeftSidebar({
     };
   }, [threadMenu]);
 
+  useEffect(() => {
+    if (!workspaceMenuOpen) return;
+    const closeMenu = (event: PointerEvent) => {
+      if (
+        !(event.target as HTMLElement).closest(
+          "[data-workspace-menu]",
+        )
+      ) {
+        setWorkspaceMenuOpen(false);
+      }
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setWorkspaceMenuOpen(false);
+        workspaceButtonRef.current?.focus();
+      }
+    };
+    const frame = window.requestAnimationFrame(() => {
+      workspaceMenuRef.current
+        ?.querySelector<HTMLButtonElement>("button")
+        ?.focus();
+    });
+    window.addEventListener("pointerdown", closeMenu);
+    window.addEventListener("keydown", closeOnEscape);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      window.removeEventListener("pointerdown", closeMenu);
+      window.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [workspaceMenuOpen]);
+
   const openThreadMenu = (
     event: ReactMouseEvent<HTMLButtonElement>,
     threadId: string,
   ) => {
     event.stopPropagation();
+    setWorkspaceMenuOpen(false);
     const rect = event.currentTarget.getBoundingClientRect();
     const menuWidth = 178;
     const menuHeight = 52;
@@ -3122,15 +3158,63 @@ function LeftSidebar({
       </div>
 
       <button
+        ref={workspaceButtonRef}
         className={`workspace-profile ${
-          settingsActive ? "active" : ""
+          settingsActive || workspaceMenuOpen ? "active" : ""
         }`}
-        onClick={onOpenSettings}
+        data-workspace-menu
+        aria-label="本地工作区菜单"
+        aria-haspopup="menu"
+        aria-expanded={workspaceMenuOpen}
+        aria-controls="workspace-profile-menu"
+        onClick={() => {
+          setBrandMenuOpen(false);
+          setThreadMenu(null);
+          setWorkspaceMenuOpen((open) => !open);
+        }}
       >
         <span className="profile-avatar">M</span>
         <strong>本地工作区</strong>
-        <CircleHelp size={16} />
+        <MoreHorizontal size={17} />
       </button>
+
+      <div
+        id="workspace-profile-menu"
+        ref={workspaceMenuRef}
+        className={`workspace-profile-menu ui-popover ${
+          workspaceMenuOpen ? "open" : ""
+        }`}
+        data-workspace-menu
+        role="menu"
+        aria-label="本地工作区"
+        aria-hidden={!workspaceMenuOpen}
+        inert={!workspaceMenuOpen}
+      >
+        <header>
+          <span className="profile-avatar">M</span>
+          <span>
+            <strong>本地工作区</strong>
+            <small>数据与配置保存在当前设备</small>
+          </span>
+        </header>
+        <div className="workspace-profile-menu-divider" />
+        <button
+          type="button"
+          role="menuitem"
+          tabIndex={workspaceMenuOpen ? 0 : -1}
+          onClick={() => {
+            setWorkspaceMenuOpen(false);
+            onOpenSettings();
+          }}
+        >
+          <Settings size={17} />
+          <span>
+            <strong>设置</strong>
+            <small>模型服务与客户端偏好</small>
+          </span>
+          <ChevronRight size={14} />
+        </button>
+      </div>
 
       <div
         className="left-resize-handle"
@@ -3410,11 +3494,6 @@ function ChatView({
           <EmptyTask
             project={project}
             accessMode={accessMode}
-            onChooseFolder={onChooseFolder}
-            onImport={onImport}
-            onCreateAiNovel={onCreateAiNovel}
-            onCreateBlankNovel={onCreateBlankNovel}
-            onOpenSettings={onOpenSettings}
           />
         ) : (
           <div className="message-column">
@@ -3825,19 +3904,9 @@ function ChatView({
 function EmptyTask({
   project,
   accessMode,
-  onChooseFolder,
-  onImport,
-  onCreateAiNovel,
-  onCreateBlankNovel,
-  onOpenSettings,
 }: {
   project: Project | null;
   accessMode: AccessMode;
-  onChooseFolder: () => void;
-  onImport: () => void;
-  onCreateAiNovel: () => void;
-  onCreateBlankNovel: () => void;
-  onOpenSettings: () => void;
 }) {
   return (
     <FadeContent className="empty-main-state">
@@ -3847,39 +3916,11 @@ function EmptyTask({
       <h1>{project ? "这轮任务要完成什么？" : "我们开始做什么？"}</h1>
       <p>
         {project
-          ? `当前任务已绑定「${project.name}」`
+          ? `描述本轮任务，Agent 将在「${project.name}」中读取和生成文件。`
           : accessMode === "full"
-            ? "直接描述任务，首次保存时会自动创建应用托管 outputs 工作区。"
-            : "直接描述任务，或选择一个本地文件夹作为项目上下文。"}
+            ? "输入小说、故事构想或制作目标，首次保存时会自动创建应用输出目录。"
+            : "输入小说、故事构想或制作目标，Agent 会从当前对话开始执行。"}
       </p>
-      <div className="empty-actions">
-        <button
-          className={project ? "secondary-button" : "primary-button"}
-          onClick={onChooseFolder}
-        >
-          <FolderOpen size={15} />
-          {project ? "更换文件夹" : "选择项目文件夹"}
-        </button>
-        <button className="primary-button" onClick={onCreateAiNovel}>
-          <Sparkles size={15} />
-          AI 创作小说
-        </button>
-        <button className="secondary-button" onClick={onImport}>
-          <FileUp size={15} />
-          导入小说
-        </button>
-        <button
-          className="secondary-button"
-          onClick={onCreateBlankNovel}
-        >
-          <SquarePen size={15} />
-          新建空白
-        </button>
-        <button className="secondary-button" onClick={onOpenSettings}>
-          <Settings size={15} />
-          打开设置
-        </button>
-      </div>
     </FadeContent>
   );
 }
@@ -4982,7 +5023,7 @@ function ManagedOutputApprovalDialog({
   onCancel: () => void;
   onApprove: () => void;
 }) {
-  return (
+  return createPortal(
     <div
       className="modal-backdrop permission-approval-backdrop"
       onMouseDown={onCancel}
@@ -5023,7 +5064,8 @@ function ManagedOutputApprovalDialog({
           </button>
         </footer>
       </section>
-    </div>
+    </div>,
+    document.body,
   );
 }
 
