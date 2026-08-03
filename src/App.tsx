@@ -96,7 +96,7 @@ type StreamingMessage = {
   threadId: string;
   content: string;
   artifactStatus?: {
-    phase: "planning" | "writing" | "saving";
+    phase: "planning" | "starting" | "writing" | "saving";
     fileName: string;
     generatedCharacters: number;
     persistedCharacters: number;
@@ -895,6 +895,23 @@ ${plan.chapters
 - 已完成：${completed.length} 章
 - 已生成正文：${completedCharacters.toLocaleString()} 字
 `;
+}
+
+function buildNovelPlanningMessage(plan: NovelDirectoryPlan) {
+  const opening = plan.chapters[0];
+  const middle = plan.chapters[Math.floor(plan.chapters.length / 2)];
+  const ending = plan.chapters.at(-1);
+  return `### 创作计划
+
+我先梳理一下这次创作：我会把《${plan.title}》写成一部 **${plan.chapters.length} 章**的完整小说。
+
+- **故事核心**：${plan.overview}
+- **开篇推进**：${opening.title}——${opening.brief}
+- **中段转折**：${middle.title}——${middle.brief}
+- **结局收束**：${ending?.title ?? middle.title}——${ending?.brief ?? middle.brief}
+- **交付方式**：创建独立作品目录，包含作品总览、章节小结和每章正文；章节会逐个生成并实时写入右侧资源栏。
+
+创作方向已经确定，接下来开始正式执行小说写作任务。`;
 }
 
 function createThread(
@@ -2211,6 +2228,26 @@ function App() {
       context.project.resources,
     );
     const resolvedPlan = { ...plan, directoryName };
+    updateThread(threadId, (thread) => ({
+      ...thread,
+      updatedAt: Date.now(),
+      messages: [
+        ...thread.messages,
+        createMessage("assistant", buildNovelPlanningMessage(resolvedPlan)),
+      ],
+    }));
+    setStreamingMessage({
+      id: messageId,
+      threadId,
+      content: "",
+      artifactStatus: {
+        phase: "starting",
+        fileName: resolvedPlan.title,
+        generatedCharacters: 0,
+        persistedCharacters: 0,
+        sequenceTotal: resolvedPlan.chapters.length,
+      },
+    });
     const summaryIntent: TextArtifactIntent = {
       category: "原著",
       title: resolvedPlan.title,
@@ -4658,7 +4695,11 @@ function ArtifactEditingStatus({
   status: NonNullable<StreamingMessage["artifactStatus"]>;
 }) {
   const isPlanning = status.phase === "planning";
+  const isStarting = status.phase === "starting";
   const isSaving = status.phase === "saving";
+  const isChapterTask = Boolean(
+    status.sequenceIndex && status.sequenceTotal,
+  );
   return (
     <div
       className="artifact-editing-status"
@@ -4673,18 +4714,24 @@ function ArtifactEditingStatus({
         <strong>
           {isPlanning
             ? "正在规划作品目录与章节"
-            : isSaving
-              ? `正在完成写入：${status.fileName}`
-              : `正在编辑：${status.fileName}`}
+            : isStarting
+              ? `正在执行小说写作任务：${status.fileName}`
+              : isSaving
+                ? `正在完成写入：${status.fileName}`
+                : isChapterTask
+                  ? "正在执行小说写作任务"
+                  : `正在编辑：${status.fileName}`}
         </strong>
         <small>
           {isPlanning
             ? "由对话模型规划任务标题、作品目录、章节与剧情小结"
-            : `${
-                status.sequenceIndex && status.sequenceTotal
-                  ? `第 ${status.sequenceIndex}/${status.sequenceTotal} 章 · `
-                  : ""
-              }已生成 ${status.generatedCharacters.toLocaleString()} 字 · 已写入 ${status.persistedCharacters.toLocaleString()} 字`}
+            : isStarting
+              ? `正在创建作品目录，随后按 ${status.sequenceTotal ?? 0} 章逐章生成并写入`
+              : `${
+                  isChapterTask
+                    ? `第 ${status.sequenceIndex}/${status.sequenceTotal} 章 · 正在编辑 ${status.fileName} · `
+                    : ""
+                }已生成 ${status.generatedCharacters.toLocaleString()} 字 · 已写入 ${status.persistedCharacters.toLocaleString()} 字`}
         </small>
       </span>
       <span className="artifact-editing-activity" aria-hidden="true">
